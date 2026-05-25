@@ -15,7 +15,16 @@ namespace Formulaar1
         internal static string? NormaliseShowType(string normalisedTitle)
         {
             var m = _showTypeRegex.Match(normalisedTitle);
-            if (!m.Success) return "Race";
+            // Previously this defaulted to "Race" when no session marker was found,
+            // which caused generic releases like "Formula1.2026.Canadian.Grand.Prix"
+            // (e.g. BILLIE all-in-one rips) to be force-mapped to the Race episode --
+            // and then to the wrong race entirely on sprint weekends, because the
+            // default GetEpisodesByShowType("Race") branch matched Sprint Race too.
+            // Returning null here drops the release out of the translation pipeline;
+            // Program.cs forwards it to Sonarr untouched and Sonarr's own parser
+            // handles it from there. Formulaar1 only translates titles whose
+            // session is explicit.
+            if (!m.Success) return null;
 
             var raw = Regex.Replace(m.Value.Trim(), @"\s+", " ");
 
@@ -53,7 +62,10 @@ namespace Formulaar1
                 if (practiceNum.Groups[3].Success) return "Practice 3";
             }
 
-            return "Race";
+            // The regex matched a session keyword but no specific branch above
+            // claimed it. Return null rather than guessing "Race" so the release
+            // is dropped instead of misrouted.
+            return null;
         }
 
         /// <summary>
@@ -77,6 +89,23 @@ namespace Formulaar1
                 "Sprint" when isF1 =>
                     candidates.Where(x => x.Title.Contains("Sprint", StringComparison.OrdinalIgnoreCase) &&
                                           !x.Title.Contains("Shootout", StringComparison.OrdinalIgnoreCase)),
+
+                // F1 "Race" must exclude Sprint Race and Feature Race episodes.
+                // The default `_ =>` branch below would otherwise match "Sprint Race"
+                // too (since "Sprint Race".Contains("Race") is true), which on a
+                // sprint weekend pulls the lower-numbered Sprint Race episode
+                // instead of the main Race.
+                "Race" when isF1 =>
+                    candidates.Where(x => x.Title.Contains("Race", StringComparison.OrdinalIgnoreCase) &&
+                                          !x.Title.Contains("Sprint Race", StringComparison.OrdinalIgnoreCase) &&
+                                          !x.Title.Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
+
+                // Same shape for Qualifying: the TVDB sprint-weekend episode list
+                // contains both "Qualifying" and "Sprint Qualifying", and the default
+                // Contains() match would grab the lower-numbered Sprint Qualifying.
+                "Qualifying" when isF1 =>
+                    candidates.Where(x => x.Title.Contains("Qualifying", StringComparison.OrdinalIgnoreCase) &&
+                                          !x.Title.Contains("Sprint Qualifying", StringComparison.OrdinalIgnoreCase)),
 
                 "Sprint Race" =>
                     candidates.Where(x => x.Title.Contains("Sprint Race", StringComparison.OrdinalIgnoreCase)),
