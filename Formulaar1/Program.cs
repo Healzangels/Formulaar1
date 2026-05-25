@@ -205,7 +205,20 @@ namespace Formulaar1
                                     }
                                     else if (Country != null)
                                     {
-                                        var Series = await _seriesApi!.ApiV3SeriesGetAsync(seriesInfo.TvdbId);
+                                        // Series lookup goes through the shim instead of _seriesApi to
+                                        // dodge the bundled client's MediaCoverTypes deserializer, which
+                                        // throws on "clearlogo" (Sonarr v4 schema). See SonarrSeriesShim.cs.
+                                        var Series = await SonarrSeriesShim.GetByTvdbIdAsync(
+                                            _httpClient, BaseSonarPath!, SonarApiKey!, seriesInfo.TvdbId);
+
+                                        if (Series.Count == 0 || Series[0].Id == null)
+                                        {
+                                            Console.WriteLine($"[Sonarr] No series found for tvdbId {seriesInfo.TvdbId} -- is the series added in Sonarr?");
+                                        }
+                                        else
+                                        {
+                                        Console.WriteLine($"[Sonarr] Resolved series '{Series[0].Title}' for tvdbId {seriesInfo.TvdbId} -> seriesId {Series[0].Id}");
+
                                         //Get all Episodes
                                         var tmp = await _episodeApi!.ApiV3EpisodeGetAsync(Series[0].Id);
                                         //Find Correct Year
@@ -221,7 +234,10 @@ namespace Formulaar1
                                         {
                                             var Quality = Regex.Match(ReleasePost.Title, @"(2160[Pp]|4[Kk]|1080[Pp]|720[Pp]|480[Pp]|240[Pp])", RegexOptions.IgnoreCase);
 
-                                            var SeriesMap = await _seriesApi.ApiV3SeriesIdGetAsync(Episode.SeriesId);
+                                            // Same reason as the GetByTvdbId call above -- bypass the
+                                            // bundled deserializer for series-by-id too.
+                                            var SeriesMap = await SonarrSeriesShim.GetByIdAsync(
+                                                _httpClient, BaseSonarPath!, SonarApiKey!, Episode.SeriesId);
 
                                             if (SeriesMap != null)
                                             {
@@ -235,6 +251,7 @@ namespace Formulaar1
                                                 ReleasePost.EpisodeNumbers = new List<int?>() { Episode.EpisodeNumber };
                                             }
                                         }
+                                        } // closes `else` (series found) introduced by clearlogo shim patch
                                     }
                                     else
                                     {
