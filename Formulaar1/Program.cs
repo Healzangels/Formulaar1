@@ -1,6 +1,7 @@
 using APIv3SonarrDotcore.Api;
 using APIv3SonarrDotcore.Model;
 using Microsoft.AspNetCore.Http.Extensions;
+using Newtonsoft.Json.Linq;
 using QBittorrent.Client;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
@@ -401,6 +402,119 @@ namespace Formulaar1
             }
             return link_unix(oldpath, newpath);
         }
+
+        /// <summary>
+        /// Tells Sonarr to import the hardlinked file. Tries the manualimport
+        /// API first (which links the import to the queue entry via downloadId
+        /// so the queue clears atomically), and falls back to the older
+        /// DownloadedEpisodesScan command + post-hoc queue DELETE if
+        /// manualimport doesn't yield importable suggestions or errors.
+        ///
+        /// Both paths produce the same end-of-disk state: file moved/linked
+        /// into the proper Season folder under Sonarr's naming convention.
+        /// They differ only in how the queue tracking entry gets cleared.
+        /// </summary>
+        private static async Task ImportViaSonarr(string hardpath, string infoHash, string torrentName)
+        {
+            bool importedViaManual = false;
+
+            try
+            {
+                var suggestions = await SonarrManualImportShim.GetSuggestionsAsync(
+                    _httpClient, BaseSonarPath!, SonarApiKey!, hardpath, infoHash);
+
+                Console.WriteLine($"[ManualImport] GET returned {suggestions.Count} suggestion(s) for {hardpath}");
+
+                var importable = new List<JObject>();
+                foreach (var item in suggestions)
+                {
+                    // Items Sonarr knows it can't accept (wrong quality profile,
+                    // episode already has a higher-scoring file, etc.) come
+                    // back with a non-empty rejections array. Surface those
+                    // reasons in the log so the user can see what Sonarr
+                    // didn't like, but don't try to POST them back.
+                    var rejections = item["rejections"] as JArray;
+                    if (rejections != null && rejections.Count > 0)
+                    {
+                        var reasons = string.Join("; ",
+                            rejections.Select(r => r["reason"]?.ToString() ?? "(unspecified)"));
+                        Console.WriteLine($"[ManualImport] Skipping rejected item '{item["name"]}': {reasons}");
+                        continue;
+                    }
+
+                    // Ensure downloadId is set on every item so Sonarr can link
+                    // this manual import to the queue entry from the original
+                    // release-push (the whole point of using this endpoint).
+                    // "auto" import mode lets Sonarr's media-management
+                    // settings decide between move/hardlink/copy.
+                    item["downloadId"] = infoHash;
+                    item["importMode"] = "auto";
+                    importable.Add(item);
+                }
+
+                if (importable.Count > 0)
+                {
+                    var (ok, detail) = await SonarrManualImportShim.CommitAsync(
+                        _httpClient, BaseSonarPath!, SonarApiKey!, importable);
+                    if (ok)
+                    {
+                        Console.WriteLine($"[ManualImport] Imported {importable.Count} file(s) via manualimport API; queue should clear automatically");
+                        importedViaManual = true;
+                    }
+                    else
+                    {
+                        var snippet = detail.Length > 200 ? detail.Substring(0, 200) + "..." : detail;
+                        Console.WriteLine($"[ManualImport] POST returned non-success: {snippet} -- falling back to scan+cleanup");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"[ManualImport] No importable suggestions ({suggestions.Count} total, all rejected or unparseable) -- falling back to scan+cleanup");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ManualImport] Failed ({ex.Message}) -- falling back to scan+cleanup");
+            }
+
+            if (importedViaManual) return;
+
+            // Fallback: classic scan command + post-hoc queue DELETE. Kept as
+            // a safety net in case manualimport doesn't apply (Sonarr API
+            // change, an edge case in our payload, network blip mid-request).
+            var commandResource = new CommandResource
+            {
+                Name = "DownloadedEpisodesScan",
+                Path = hardpath,
+                ImportMode = CommandResource.ImportModeEnum.Auto
+            };
+            await _commandApi!.ApiV3CommandPostAsync(commandResource);
+            Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrentName} for path \"{commandResource.Path}\"");
+
+            try
+            {
+                await Task.Delay(5000);
+                var stale = await SonarrQueueShim.GetByDownloadIdAsync(_httpClient, BaseSonarPath!, SonarApiKey!, infoHash);
+                foreach (var q in stale)
+                {
+                    if (q.Id is int qid)
+                    {
+                        await SonarrQueueShim.DeleteAsync(_httpClient, BaseSonarPath!, SonarApiKey!,
+                            qid, removeFromClient: false, blocklist: false);
+                        Console.WriteLine($"[Hardlinking] Removed stale Sonarr queue item {qid} ('{q.Title}') -- file already imported via scan");
+                    }
+                }
+                if (stale.Count == 0)
+                {
+                    Console.WriteLine($"[Hardlinking] No matching queue item to clean up for {infoHash} (Sonarr may have already cleared it)");
+                }
+            }
+            catch (Exception cleanupEx)
+            {
+                Console.WriteLine($"[Hardlinking] Queue cleanup failed (file is imported anyway): {cleanupEx.Message}");
+            }
+        }
+
         private static async void _checkEvents(object? sender, System.Timers.ElapsedEventArgs e)
         {
             if (!running)
@@ -608,16 +722,6 @@ namespace Formulaar1
                                                 }
                                             }
 
-                                            var commandResource = new CommandResource
-                                            {
-                                                Name = "DownloadedEpisodesScan",
-                                                Path = hardpathcomplete,
-                                                ImportMode = CommandResource.ImportModeEnum.Auto
-                                            };
-
-                                            await _commandApi!.ApiV3CommandPostAsync(commandResource);
-
-                                            Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrent.Name} for path \"{commandResource.Path}\"");
                                         }
                                         else
                                         {
@@ -641,57 +745,14 @@ namespace Formulaar1
                                                 int linkResult = HardLink(ofInfo.ToString(), nfInfo.ToString());
                                                 if (linkResult != 0) Console.WriteLine($"Hard link failed (code {linkResult}): {ofInfo.Name}");
                                             }
-
-                                            var commandResource = new CommandResource
-                                            {
-                                                Name = "DownloadedEpisodesScan",
-                                                Path = hardpathcomplete,
-                                                ImportMode = CommandResource.ImportModeEnum.Auto
-                                            };
-
-                                            await _commandApi!.ApiV3CommandPostAsync(commandResource);
-
-                                            Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrent.Name} for path \"{commandResource.Path}\"");
                                         }
 
-                                        // Clean up the stale Sonarr queue entry that CDH leaves behind.
-                                        // Sonarr's Completed Download Handler runs in parallel with our
-                                        // hardlink + scan path. CDH tries to import directly from the
-                                        // qBit download folder, where the filename has no SxxExx, so it
-                                        // fails with 'Invalid season or episode' and leaves the queue
-                                        // item stuck on 'Waiting to Import' -- even though the scan
-                                        // command we just sent will successfully import the hardlinked
-                                        // copy a moment later. Wait a few seconds for the scan-side
-                                        // import to actually complete (so an EpisodeFileImported event
-                                        // lands in Sonarr's history), then DELETE the matching queue
-                                        // entry by downloadId. With the import event in history, CDH
-                                        // treats the torrent as already-handled on its next poll and
-                                        // won't reinstate the queue tracking. removeFromClient=false
-                                        // keeps the torrent in qBit so seeding continues.
-                                        try
-                                        {
-                                            await Task.Delay(5000);
-                                            var stale = await SonarrQueueShim.GetByDownloadIdAsync(
-                                                _httpClient, BaseSonarPath!, SonarApiKey!, sonarrItem.InfoHash!);
-                                            foreach (var q in stale)
-                                            {
-                                                if (q.Id is int qid)
-                                                {
-                                                    await SonarrQueueShim.DeleteAsync(
-                                                        _httpClient, BaseSonarPath!, SonarApiKey!,
-                                                        qid, removeFromClient: false, blocklist: false);
-                                                    Console.WriteLine($"[Hardlinking] Removed stale Sonarr queue item {qid} ('{q.Title}') -- file already imported via scan");
-                                                }
-                                            }
-                                            if (stale.Count == 0)
-                                            {
-                                                Console.WriteLine($"[Hardlinking] No matching queue item to clean up for {sonarrItem.InfoHash} (Sonarr may have already cleared it)");
-                                            }
-                                        }
-                                        catch (Exception cleanupEx)
-                                        {
-                                            Console.WriteLine($"[Hardlinking] Queue cleanup failed (file is imported anyway): {cleanupEx.Message}");
-                                        }
+                                        // Both branches converge here: hardlinks (or hardlink) are in
+                                        // place inside hardpathcomplete. Hand off to ImportViaSonarr
+                                        // which prefers the manualimport API (queue clears via
+                                        // downloadId linkage) and falls back to the older
+                                        // DownloadedEpisodesScan + DELETE path on failure.
+                                        await ImportViaSonarr(hardpathcomplete, sonarrItem.InfoHash!, torrent.Name!);
 
                                         _hashes = new ConcurrentBag<ReleaseResource>(_hashes.Except(new[] { r }));
                                         if (!string.IsNullOrEmpty(r.Title))
