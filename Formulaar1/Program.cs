@@ -297,6 +297,10 @@ namespace Formulaar1
                                         if (r.Rejected == false)
                                         {
                                             Console.WriteLine($"[Sonarr] ACCEPTED: {r.Title}");
+                                            // Normalise InfoHash to lower case at the source so all later
+                                            // comparisons (against qBit's lower-cased Hash field) just
+                                            // work. Sonarr returns it upper-cased.
+                                            if (!string.IsNullOrEmpty(r.InfoHash)) r.InfoHash = r.InfoHash.ToLower();
                                             _hashes.Add(r);
                                             if (enableHardlinking && !_timer.Enabled)
                                             {
@@ -476,7 +480,12 @@ namespace Formulaar1
                                 var torrent = result.FirstOrDefault();
                                 if (torrent != null && torrent.CompletionOn != null)
                                 {
-                                    var sonarrItem = _hashes.Where(x => x.InfoHash == torrent.Hash).FirstOrDefault();
+                                    // Case-insensitive match: Sonarr's push response gives InfoHash
+                                    // in UPPER case (preserved from the source), qBit's response
+                                    // gives Hash in lower case. The original equality silently fails
+                                    // every tick and sonarrItem stays null -- the hardlink branch
+                                    // never runs even though the download is complete.
+                                    var sonarrItem = _hashes.Where(x => string.Equals(x.InfoHash, torrent.Hash, StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
                                     if (sonarrItem != null)
                                     {
                                         FileAttributes attr = File.GetAttributes(Path.Combine(torrent.SavePath!, torrent.Name!));
