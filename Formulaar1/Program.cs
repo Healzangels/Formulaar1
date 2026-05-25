@@ -303,8 +303,11 @@ namespace Formulaar1
                                             // pushes that Sonarr silently rejects (episode not found,
                                             // quality profile mismatch, already grabbed, etc.) appear
                                             // healthy in Formulaar1's logs but never actually download.
+                                            // In this SDK version Rejections is List<string>, not a list
+                                            // of {Reason, Type} objects -- the strings are already the
+                                            // human-readable rejection reasons.
                                             var reasons = (r.Rejections != null && r.Rejections.Count > 0)
-                                                ? string.Join(" | ", r.Rejections.Select(x => x.Reason ?? "(unspecified)"))
+                                                ? string.Join(" | ", r.Rejections)
                                                 : "(no rejection details returned by Sonarr)";
                                             Console.WriteLine($"[Sonarr] REJECTED: {r.Title} -- {reasons}");
                                         }
