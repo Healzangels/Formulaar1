@@ -603,6 +603,45 @@ namespace Formulaar1
                                             Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrent.Name} for path \"{commandResource.Path}\"");
                                         }
 
+                                        // Clean up the stale Sonarr queue entry that CDH leaves behind.
+                                        // Sonarr's Completed Download Handler runs in parallel with our
+                                        // hardlink + scan path. CDH tries to import directly from the
+                                        // qBit download folder, where the filename has no SxxExx, so it
+                                        // fails with 'Invalid season or episode' and leaves the queue
+                                        // item stuck on 'Waiting to Import' -- even though the scan
+                                        // command we just sent will successfully import the hardlinked
+                                        // copy a moment later. Wait a few seconds for the scan-side
+                                        // import to actually complete (so an EpisodeFileImported event
+                                        // lands in Sonarr's history), then DELETE the matching queue
+                                        // entry by downloadId. With the import event in history, CDH
+                                        // treats the torrent as already-handled on its next poll and
+                                        // won't reinstate the queue tracking. removeFromClient=false
+                                        // keeps the torrent in qBit so seeding continues.
+                                        try
+                                        {
+                                            await Task.Delay(5000);
+                                            var stale = await SonarrQueueShim.GetByDownloadIdAsync(
+                                                _httpClient, BaseSonarPath!, SonarApiKey!, sonarrItem.InfoHash!);
+                                            foreach (var q in stale)
+                                            {
+                                                if (q.Id is int qid)
+                                                {
+                                                    await SonarrQueueShim.DeleteAsync(
+                                                        _httpClient, BaseSonarPath!, SonarApiKey!,
+                                                        qid, removeFromClient: false, blocklist: false);
+                                                    Console.WriteLine($"[Hardlinking] Removed stale Sonarr queue item {qid} ('{q.Title}') -- file already imported via scan");
+                                                }
+                                            }
+                                            if (stale.Count == 0)
+                                            {
+                                                Console.WriteLine($"[Hardlinking] No matching queue item to clean up for {sonarrItem.InfoHash} (Sonarr may have already cleared it)");
+                                            }
+                                        }
+                                        catch (Exception cleanupEx)
+                                        {
+                                            Console.WriteLine($"[Hardlinking] Queue cleanup failed (file is imported anyway): {cleanupEx.Message}");
+                                        }
+
                                         _hashes = new ConcurrentBag<ReleaseResource>(_hashes.Except(new[] { r }));
                                         if (_hashes.IsEmpty) Console.WriteLine("[Hardlinking] Queue empty — monitor idle.");
                                     }
