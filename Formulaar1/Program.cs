@@ -232,17 +232,24 @@ namespace Formulaar1
 
                                         if (Episode != null)
                                         {
-                                            var Quality = Regex.Match(ReleasePost.Title, @"(2160[Pp]|4[Kk]|1080[Pp]|720[Pp]|480[Pp]|240[Pp])", RegexOptions.IgnoreCase);
-                                            // Preserve the source marker (WEB-DL / BluRay / HDTV / etc.)
-                                            // from the original release title. Without it, Sonarr's parser
-                                            // sees only a resolution in the rewritten title and defaults to
-                                            // HDTV-<res>, which causes WEB-DL F1Carreras releases to be
-                                            // mis-tagged as HDTV-1080p and either downgraded or rejected
-                                            // against existing WEBDL-1080p files on disk.
-                                            var Source = Regex.Match(ReleasePost.Title,
-                                                @"(WEB[-. ]?DL|WEB[-. ]?RIP|BluRay|REMUX|BDRip|HDTV|HDRip|DVDRip|PDTV)",
-                                                RegexOptions.IgnoreCase);
-                                            var QualityTag = Source.Success ? $"{Source.Value} {Quality.Value}" : Quality.Value;
+                                            // Inject SxxExx into the ORIGINAL release title rather than
+                                            // fully rewriting it. Sonarr's parser only needs an SxxExx
+                                            // marker to map the release to the correct TVDB episode;
+                                            // everything else in the title (release group, source/codec,
+                                            // and indexer-specific markers like F1TV / F1LIVE / SKY / MWR)
+                                            // is what Sonarr's Custom Formats use for scoring.
+                                            //
+                                            // The previous rewrite stripped all of that out, so every
+                                            // release got Custom Format score 0 and the user's curated
+                                            // per-source / per-group preferences were never applied.
+                                            // Preserving the original title means Custom Formats fire
+                                            // again and Sonarr can pick a preferred source from several
+                                            // simultaneous offers for the same episode.
+                                            //
+                                            // This also subsumes the earlier "source tag" patch: WEB-DL /
+                                            // BluRay / HDTV / etc. ride along in the original title
+                                            // naturally, so Sonarr's quality parser sees them too.
+                                            var originalTitle = ReleasePost.Title!;
 
                                             // Same reason as the GetByTvdbId call above -- bypass the
                                             // bundled deserializer for series-by-id too.
@@ -255,7 +262,7 @@ namespace Formulaar1
 
                                                 ReleasePost.SceneMapping = SceneMapping;
                                                 ReleasePost.TvdbId = SeriesMap.TvdbId;
-                                                ReleasePost.Title = $"{SeriesMap.Title} - S{Episode.SeasonNumber}E{string.Format("{0:00}", Episode.EpisodeNumber)} - {Episode.Title} {QualityTag}";
+                                                ReleasePost.Title = $"{SeriesMap.Title} - S{Episode.SeasonNumber}E{string.Format("{0:00}", Episode.EpisodeNumber)} - {originalTitle}";
                                                 ReleasePost.SeriesId = SeriesMap.Id;
                                                 ReleasePost.SeasonNumber = Episode.SeasonNumber;
                                                 ReleasePost.EpisodeNumbers = new List<int?>() { Episode.EpisodeNumber };
