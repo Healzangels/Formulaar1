@@ -376,6 +376,7 @@ namespace Formulaar1
 
                 foreach (var r in _hashes.ToList())
                 {
+                    Console.WriteLine($"[Hardlinking] Processing release '{r.Title}' (InfoHash={(r.InfoHash ?? "<null>")})");
                     if (r.InfoHash == null)
                     {
                         // Go through the shim instead of _historyApi: the bundled
@@ -452,6 +453,23 @@ namespace Formulaar1
                         {
                             var query = new TorrentListQuery() { Hashes = new string[] { r.InfoHash } };
                             var result = await _qBittorrentClient!.GetTorrentListAsync(query);
+
+                            // Diagnostic: surface whether qBit has the torrent and
+                            // whether it's complete. Both gates were previously silent
+                            // dead-ends -- if qBit returned zero matches (e.g. hash
+                            // case mismatch, torrent not added yet, or wrong client)
+                            // OR the torrent was still downloading (CompletionOn null),
+                            // the foreach iteration did nothing and the next monitor
+                            // tick repeated the same nothing.
+                            if (result.Count == 0)
+                            {
+                                Console.WriteLine($"[Hardlinking] qBit has no torrent with hash {r.InfoHash} -- still being added? Will retry next tick.");
+                            }
+                            else
+                            {
+                                var probe = result.FirstOrDefault();
+                                Console.WriteLine($"[Hardlinking] qBit returned {result.Count} torrent(s) for hash {r.InfoHash}: name='{probe?.Name}' completionOn={(probe?.CompletionOn?.ToString("u") ?? "<null, still downloading>")}");
+                            }
 
                             if (result.Count > 0)
                             {
