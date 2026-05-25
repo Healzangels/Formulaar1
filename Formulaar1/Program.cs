@@ -16,17 +16,24 @@ namespace Formulaar1
 
         private static SeriesApi? _seriesApi;
         private static EpisodeApi? _episodeApi;
-        //private static SeasonPassApi? _seasonPassApi;
         private static ReleasePushApi? _releasePushApi;
-        //private static QueueStatusApi? _queueStatusApi;
-        //private static QueueDetailsApi? _queueDetailsApi;
         private static CommandApi? _commandApi;
-        private static HistoryApi? _historyApi;
         private static HttpClient _httpClient = new();
 
         private static QBittorrentClient? _qBittorrentClient;
 
         private static ConcurrentBag<ReleaseResource> _hashes = new ConcurrentBag<ReleaseResource>();
+
+        // Tracks when each release was added to _hashes (keyed by Title). Used by
+        // the hardlink monitor to evict stuck entries -- releases that were
+        // accepted by Sonarr but never resolved to a completed qBit torrent.
+        // Without this, a release whose InfoHash never gets matched (qBit drop,
+        // history mismatch, etc.) sits in _hashes for the container's lifetime
+        // and the monitor keeps logging diagnostics for it every 10 seconds.
+        private static ConcurrentDictionary<string, DateTime> _queuedAt = new();
+
+        // Wall-clock UTC at startup, surfaced via /health for uptime tracking.
+        private static readonly DateTime _startedAt = DateTime.UtcNow;
 
         private static System.Timers.Timer _timer = new System.Timers.Timer();
 
@@ -72,13 +79,13 @@ namespace Formulaar1
                 Configuration.Default.UserAgent = "Formulaar1";
 
                 _seriesApi = new SeriesApi();
-                //_seasonPassApi = new SeasonPassApi();
                 _episodeApi = new EpisodeApi();
                 _releasePushApi = new ReleasePushApi();
-                //_queueStatusApi = new QueueStatusApi();
-                //_queueDetailsApi = new QueueDetailsApi();
-                _historyApi = new HistoryApi();
                 _commandApi = new CommandApi();
+                // _historyApi was here previously but its single call site moved
+                // to SonarrHistoryShim (the bundled client deserialiser chokes on
+                // Sonarr v4's clearlogo). The field/init are gone -- if you ever
+                // need to re-add a history-related Sonarr call, use the shim.
             }
             else
             {
@@ -137,6 +144,27 @@ namespace Formulaar1
             _ = app.Use(async (context, next) =>
             {
                 string pathAndQuery = context.Request.GetEncodedPathAndQuery();
+
+                // Health endpoint: open, no auth, returns only non-sensitive fields
+                // so it's safe for Docker healthchecks, Uptime Kuma, etc. to poll
+                // without leaking URLs, API keys, file paths, or grab history.
+                if (context.Request.Method == "GET" &&
+                    (pathAndQuery == "/health" || pathAndQuery.StartsWith("/health?", StringComparison.Ordinal)))
+                {
+                    var health = new
+                    {
+                        status = "ok",
+                        version = "v0.5.0-fix13",
+                        uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
+                        torrentClient = TorrentClient ?? "none",
+                        sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
+                        hardlinkingEnabled = enableHardlinking,
+                        releasesInQueue = _hashes.Count,
+                    };
+                    context.Response.StatusCode = 200;
+                    await context.Response.WriteAsJsonAsync(health);
+                    return;
+                }
 
                 const string apiEndpoint = "/api";
                 if (!pathAndQuery.StartsWith(apiEndpoint))
@@ -302,6 +330,14 @@ namespace Formulaar1
                                             // work. Sonarr returns it upper-cased.
                                             if (!string.IsNullOrEmpty(r.InfoHash)) r.InfoHash = r.InfoHash.ToLower();
                                             _hashes.Add(r);
+                                            // Stamp the add-time so the monitor can evict releases that
+                                            // never resolve to a completed qBit torrent (qBit dropped
+                                            // the torrent, hash mismatch, etc.). Keyed by Title since
+                                            // that's the one field guaranteed non-null at this point.
+                                            if (!string.IsNullOrEmpty(r.Title))
+                                            {
+                                                _queuedAt[r.Title] = DateTime.UtcNow;
+                                            }
                                             if (enableHardlinking && !_timer.Enabled)
                                             {
                                                 _timer.Start();
@@ -380,6 +416,21 @@ namespace Formulaar1
 
                 foreach (var r in _hashes.ToList())
                 {
+                    // Stuck-release eviction. If a release has been in _hashes
+                    // for more than 24 hours and never resolved, something's
+                    // genuinely wrong (qBit dropped the torrent, hash mismatch
+                    // we can't fix, Sonarr/qBit unreachable, etc.) -- evict it
+                    // so the monitor stops re-checking it forever.
+                    if (!string.IsNullOrEmpty(r.Title) &&
+                        _queuedAt.TryGetValue(r.Title, out var queuedAt) &&
+                        (DateTime.UtcNow - queuedAt).TotalHours > 24)
+                    {
+                        Console.WriteLine($"[Hardlinking] Evicting stuck release after >24h: '{r.Title}' (never resolved to a completed qBit torrent). Check qBit and Sonarr connectivity.");
+                        _hashes = new ConcurrentBag<ReleaseResource>(_hashes.Except(new[] { r }));
+                        _queuedAt.TryRemove(r.Title, out _);
+                        continue;
+                    }
+
                     Console.WriteLine($"[Hardlinking] Processing release '{r.Title}' (InfoHash={(r.InfoHash ?? "<null>")})");
                     if (r.InfoHash == null)
                     {
@@ -643,6 +694,10 @@ namespace Formulaar1
                                         }
 
                                         _hashes = new ConcurrentBag<ReleaseResource>(_hashes.Except(new[] { r }));
+                                        if (!string.IsNullOrEmpty(r.Title))
+                                        {
+                                            _queuedAt.TryRemove(r.Title, out _);
+                                        }
                                         if (_hashes.IsEmpty) Console.WriteLine("[Hardlinking] Queue empty — monitor idle.");
                                     }
                                 }
