@@ -367,6 +367,7 @@ namespace Formulaar1
             {
                 if (_hashes.IsEmpty) { running = false; return; }
                 running = true;
+                Console.WriteLine($"[Hardlinking] Monitor tick: {_hashes.Count} release(s) in queue");
                 ////
                 ///Used to monitor qBit and then Hardlink once the download is complete 
                 ///and will also trigger a media import og the torrent folder in Sonarr.
@@ -377,16 +378,30 @@ namespace Formulaar1
                 {
                     if (r.InfoHash == null)
                     {
-                        var history = await _historyApi!.ApiV3HistoryGetAsync(null, true);
-
-                        foreach (var h in history.Records.Where(x => x.SourceTitle == r.Title && x.Date < DateTime.Now.AddMinutes(-1)))
+                        // Go through the shim instead of _historyApi: the bundled
+                        // APIv3SonarrDotcore client crashes deserializing modern Sonarr
+                        // history responses (same MediaCoverTypes "clearlogo" issue as
+                        // the series endpoint). Wrap in try/catch defensively so even
+                        // an unexpected failure here can't kill the timer loop.
+                        try
                         {
-                            if (h.EventType == EpisodeHistoryEventType.Grabbed)
+                            var history = await SonarrHistoryShim.GetRecentAsync(
+                                _httpClient, BaseSonarPath!, SonarApiKey!);
+
+                            foreach (var h in history.Records.Where(x => x.SourceTitle == r.Title && x.Date < DateTime.Now.AddMinutes(-1)))
                             {
-                                Console.WriteLine($"Added Grabbed Torrent from Sonarr history {h.DownloadId}");
-                                r.InfoHash = h.DownloadId.ToLower();
+                                if (string.Equals(h.EventType, "grabbed", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    Console.WriteLine($"[Hardlinking] Resolved InfoHash from Sonarr history: {h.DownloadId} for '{r.Title}'");
+                                    r.InfoHash = h.DownloadId?.ToLower();
+                                }
                             }
                         }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Hardlinking] History lookup failed for '{r.Title}': {ex.Message}");
+                        }
+
                         await Task.Delay(1000);
                     }
 
