@@ -512,33 +512,6 @@ namespace Formulaar1
 
                                         Directory.CreateDirectory(hardpathcomplete);
 
-                                        // chmod 0777 on the new directory so Sonarr can write here.
-                                        // Background: the Formulaar1 container runs as root by default
-                                        // (no USER directive in the upstream Dockerfile; the PUID/PGID
-                                        // env vars are decorative -- there's no entrypoint script that
-                                        // actually drops privileges). New directories therefore land as
-                                        // root:root mode 755. Sonarr running as nobody:users (UID 99 on
-                                        // Unraid) can enter and READ here -- that's why its scan parses
-                                        // the file -- but it cannot WRITE, and the import step has to
-                                        // remove the source dir entry when moving the file into the
-                                        // Season folder. Result: 'Access to the path is denied' on what
-                                        // looks like the file but is really the parent-dir permission.
-                                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
-                                            RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                                        {
-                                            try
-                                            {
-                                                File.SetUnixFileMode(hardpathcomplete,
-                                                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                                                    UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
-                                                    UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
-                                            }
-                                            catch (Exception modeEx)
-                                            {
-                                                Console.WriteLine($"[Hardlinking] Could not chmod 0777 on {hardpathcomplete}: {modeEx.Message}");
-                                            }
-                                        }
-
                                         if ((attr & FileAttributes.Directory) == FileAttributes.Directory)
                                         {
                                             var files = Directory.GetFiles(Path.Combine(torrent.SavePath!, torrent.Name!));
