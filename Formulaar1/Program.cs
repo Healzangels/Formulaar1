@@ -233,6 +233,16 @@ namespace Formulaar1
                                         if (Episode != null)
                                         {
                                             var Quality = Regex.Match(ReleasePost.Title, @"(2160[Pp]|4[Kk]|1080[Pp]|720[Pp]|480[Pp]|240[Pp])", RegexOptions.IgnoreCase);
+                                            // Preserve the source marker (WEB-DL / BluRay / HDTV / etc.)
+                                            // from the original release title. Without it, Sonarr's parser
+                                            // sees only a resolution in the rewritten title and defaults to
+                                            // HDTV-<res>, which causes WEB-DL F1Carreras releases to be
+                                            // mis-tagged as HDTV-1080p and either downgraded or rejected
+                                            // against existing WEBDL-1080p files on disk.
+                                            var Source = Regex.Match(ReleasePost.Title,
+                                                @"(WEB[-. ]?DL|WEB[-. ]?RIP|BluRay|REMUX|BDRip|HDTV|HDRip|DVDRip|PDTV)",
+                                                RegexOptions.IgnoreCase);
+                                            var QualityTag = Source.Success ? $"{Source.Value} {Quality.Value}" : Quality.Value;
 
                                             // Same reason as the GetByTvdbId call above -- bypass the
                                             // bundled deserializer for series-by-id too.
@@ -245,7 +255,7 @@ namespace Formulaar1
 
                                                 ReleasePost.SceneMapping = SceneMapping;
                                                 ReleasePost.TvdbId = SeriesMap.TvdbId;
-                                                ReleasePost.Title = $"{SeriesMap.Title} - S{Episode.SeasonNumber}E{string.Format("{0:00}", Episode.EpisodeNumber)} - {Episode.Title} {Quality}";
+                                                ReleasePost.Title = $"{SeriesMap.Title} - S{Episode.SeasonNumber}E{string.Format("{0:00}", Episode.EpisodeNumber)} - {Episode.Title} {QualityTag}";
                                                 ReleasePost.SeriesId = SeriesMap.Id;
                                                 ReleasePost.SeasonNumber = Episode.SeasonNumber;
                                                 ReleasePost.EpisodeNumbers = new List<int?>() { Episode.EpisodeNumber };
@@ -274,10 +284,12 @@ namespace Formulaar1
 
                                 if (response != null)
                                 {
+                                    Console.WriteLine($"[Sonarr] Push response: {response.Count} decision(s)");
                                     foreach (var r in response)
                                     {
                                         if (r.Rejected == false)
                                         {
+                                            Console.WriteLine($"[Sonarr] ACCEPTED: {r.Title}");
                                             _hashes.Add(r);
                                             if (enableHardlinking && !_timer.Enabled)
                                             {
@@ -285,7 +297,22 @@ namespace Formulaar1
                                                 Console.WriteLine("[Hardlinking] Release queued — starting download monitor.");
                                             }
                                         }
+                                        else
+                                        {
+                                            // Surface Sonarr's rejection reasons inline. Without this,
+                                            // pushes that Sonarr silently rejects (episode not found,
+                                            // quality profile mismatch, already grabbed, etc.) appear
+                                            // healthy in Formulaar1's logs but never actually download.
+                                            var reasons = (r.Rejections != null && r.Rejections.Count > 0)
+                                                ? string.Join(" | ", r.Rejections.Select(x => x.Reason ?? "(unspecified)"))
+                                                : "(no rejection details returned by Sonarr)";
+                                            Console.WriteLine($"[Sonarr] REJECTED: {r.Title} -- {reasons}");
+                                        }
                                     }
+                                }
+                                else
+                                {
+                                    Console.WriteLine("[Sonarr] Push response was null -- check Sonarr connectivity / API key.");
                                 }
 
                                 var result = response;
