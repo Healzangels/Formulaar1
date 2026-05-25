@@ -406,7 +406,26 @@ namespace Formulaar1
                                     if (sonarrItem != null)
                                     {
                                         FileAttributes attr = File.GetAttributes(Path.Combine(torrent.SavePath!, torrent.Name!));
-                                        var hardpathcomplete = Path.Combine(Hardlinkpath!, sonarrItem.Title!);
+
+                                        // Sanitize for filesystem use. After the fix4 title-preservation
+                                        // change, sonarrItem.Title carries the FULL original release name
+                                        // (so Sonarr's Custom Formats can score it at push-time). That
+                                        // string can contain characters that explode Path.Combine -- most
+                                        // notably the '/' inside indexer-added markers like
+                                        // "[SEEDERS (34)/LEECHERS (1)]", which on Linux gets treated as a
+                                        // directory separator and creates a nested folder where one was
+                                        // expected. Extract the canonical "Series - SxxExx" prefix when
+                                        // present (Sonarr's parser only needs SxxExx in the filename to
+                                        // map the imported file to the correct episode); otherwise strip
+                                        // path-hostile characters from the full title.
+                                        var canonicalPrefix = Regex.Match(sonarrItem.Title ?? string.Empty,
+                                            @"^.+?\s-\sS\d+E\d+", RegexOptions.IgnoreCase).Value;
+                                        var safeTitle = !string.IsNullOrWhiteSpace(canonicalPrefix)
+                                            ? canonicalPrefix
+                                            : Regex.Replace(sonarrItem.Title ?? "release",
+                                                @"[<>:""/\\|?*\[\]\r\n\t]", " ").Trim();
+
+                                        var hardpathcomplete = Path.Combine(Hardlinkpath!, safeTitle);
 
                                         Directory.CreateDirectory(hardpathcomplete);
 
@@ -418,11 +437,11 @@ namespace Formulaar1
                                             foreach (var file in files)
                                             {
                                                 var ofInfo = new FileInfo(file);
-                                                var nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - {ofInfo.Name}");
+                                                var nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - {ofInfo.Name}");
 
                                                 if (ofInfo.Name.ToLower().Contains("buildup"))
                                                 {
-                                                    nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - Part1{ofInfo.Extension}");
+                                                    nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - Part1{ofInfo.Extension}");
 
                                                     Console.WriteLine($"Hard Linking {ofInfo.Name} to {nfInfo.Name}");
                                                     int linkResult = HardLink(ofInfo.ToString(), nfInfo.ToString());
@@ -430,7 +449,7 @@ namespace Formulaar1
                                                 }
                                                 else if (ofInfo.Name.ToLower().Contains("session"))
                                                 {
-                                                    nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - Part2{ofInfo.Extension}");
+                                                    nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - Part2{ofInfo.Extension}");
 
                                                     Console.WriteLine($"Hard Linking {ofInfo.Name} to {nfInfo.Name}");
                                                     int linkResult = HardLink(ofInfo.ToString(), nfInfo.ToString());
@@ -438,7 +457,7 @@ namespace Formulaar1
                                                 }
                                                 else if (ofInfo.Name.ToLower().Contains("analysis"))
                                                 {
-                                                    nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - Part3{ofInfo.Extension}");
+                                                    nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - Part3{ofInfo.Extension}");
 
                                                     Console.WriteLine($"Hard Linking {ofInfo.Name} to {nfInfo.Name}");
                                                     int linkResult = HardLink(ofInfo.ToString(), nfInfo.ToString());
@@ -474,13 +493,13 @@ namespace Formulaar1
 
                                             FileInfo nfInfo;
                                             if (nameLower.Contains("buildup"))
-                                                nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - Part1{ofInfo.Extension}");
+                                                nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - Part1{ofInfo.Extension}");
                                             else if (nameLower.Contains("session"))
-                                                nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - Part2{ofInfo.Extension}");
+                                                nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - Part2{ofInfo.Extension}");
                                             else if (nameLower.Contains("analysis"))
-                                                nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title} - Part3{ofInfo.Extension}");
+                                                nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle} - Part3{ofInfo.Extension}");
                                             else
-                                                nfInfo = new FileInfo($"{hardpathcomplete}/{sonarrItem.Title}{ofInfo.Extension}");
+                                                nfInfo = new FileInfo($"{hardpathcomplete}/{safeTitle}{ofInfo.Extension}");
 
                                             if (!File.Exists(nfInfo.ToString()))
                                             {
