@@ -388,13 +388,54 @@ namespace Formulaar1
                             var history = await SonarrHistoryShim.GetRecentAsync(
                                 _httpClient, BaseSonarPath!, SonarApiKey!);
 
-                            foreach (var h in history.Records.Where(x => x.SourceTitle == r.Title && x.Date < DateTime.Now.AddMinutes(-1)))
+                            // Build the SxxExx marker we injected into the release title.
+                            // Matching on this rather than full SourceTitle equality is
+                            // robust to any normalisation Sonarr applies (whitespace,
+                            // trailing chars) and uses an invariant we control.
+                            var seasonNum = r.SeasonNumber ?? 0;
+                            var episodeNum = r.EpisodeNumbers?.FirstOrDefault() ?? 0;
+                            var sxxexx = $"S{seasonNum}E{episodeNum:00}";
+
+                            // Sonarr's history endpoint returns Date as UTC (ISO 8601
+                            // with 'Z'), which Newtonsoft deserialises with Kind=Utc.
+                            // Upstream compared against DateTime.Now (local), and C#'s
+                            // DateTime comparison ignores Kind -- it compares raw ticks.
+                            // On any container with a non-UTC TZ (e.g. America/New_York
+                            // = EDT -4h), every Sonarr record looks ~4h in the future
+                            // relative to local "now - 1 minute" and is filtered out.
+                            // Result: monitor ticks forever, history scan finds nothing,
+                            // InfoHash never resolves, hardlink never runs. Compare
+                            // against UtcNow so this works regardless of container TZ.
+                            // (Also relaxed the cushion from 1min to 30s -- enough for
+                            // qBit to register the torrent without making testing slow.)
+                            var grabs = history.Records
+                                .Where(x => x.Date < DateTime.UtcNow.AddSeconds(-30) &&
+                                            string.Equals(x.EventType, "grabbed", StringComparison.OrdinalIgnoreCase) &&
+                                            !string.IsNullOrEmpty(x.SourceTitle) &&
+                                            x.SourceTitle.Contains(sxxexx, StringComparison.OrdinalIgnoreCase))
+                                .OrderByDescending(x => x.Date)
+                                .ToList();
+
+                            if (grabs.Count == 0)
                             {
-                                if (string.Equals(h.EventType, "grabbed", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    Console.WriteLine($"[Hardlinking] Resolved InfoHash from Sonarr history: {h.DownloadId} for '{r.Title}'");
-                                    r.InfoHash = h.DownloadId?.ToLower();
-                                }
+                                // Diagnostic: dump the 3 most recent grabs so we can see
+                                // why our match failed. Cheap once-per-tick log; if you
+                                // see this firing every tick after an accepted push,
+                                // either the SxxExx isn't actually in SourceTitle or the
+                                // date filter is still excluding it.
+                                var recent = history.Records
+                                    .Where(x => string.Equals(x.EventType, "grabbed", StringComparison.OrdinalIgnoreCase))
+                                    .OrderByDescending(x => x.Date)
+                                    .Take(3)
+                                    .Select(x => $"'{(x.SourceTitle ?? "").Substring(0, Math.Min(70, (x.SourceTitle ?? "").Length))}' @ {x.Date:u}")
+                                    .ToList();
+                                Console.WriteLine($"[Hardlinking] No grab matching {sxxexx} in history yet. Recent grabs: {(recent.Count == 0 ? "(none)" : string.Join(" | ", recent))}");
+                            }
+                            else
+                            {
+                                var h = grabs.First();
+                                Console.WriteLine($"[Hardlinking] Resolved InfoHash from Sonarr history: {h.DownloadId} for '{r.Title}' (matched {sxxexx})");
+                                r.InfoHash = h.DownloadId?.ToLower();
                             }
                         }
                         catch (Exception ex)
