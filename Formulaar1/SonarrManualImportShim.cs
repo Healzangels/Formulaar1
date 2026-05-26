@@ -3,36 +3,39 @@ using Newtonsoft.Json.Linq;
 namespace Formulaar1
 {
     /// <summary>
-    /// Minimal direct-HTTP access to Sonarr's <c>/api/v3/manualimport</c>
-    /// endpoint. Same shim treatment as the series/history/queue shims --
-    /// the bundled <c>APIv3SonarrDotcore</c> client doesn't expose this
-    /// endpoint, and even if it did the deeply-nested response would trip
-    /// the <c>MediaCoverTypes</c> deserialiser.
+    /// Direct-HTTP access to Sonarr's manual import endpoints. Same shim
+    /// treatment as the series/history/queue shims -- the bundled
+    /// <c>APIv3SonarrDotcore</c> client doesn't expose these endpoints,
+    /// and even if it did the deeply-nested response would trip the
+    /// <c>MediaCoverTypes</c> deserialiser.
     ///
     /// <para>
-    /// Why we use this instead of <c>DownloadedEpisodesScan</c> (opt-in via
-    /// the <c>ImportMode: "manualimport"</c> config flag added in fix22):
+    /// Two halves to the flow, used when <c>ImportMode: "manualimport"</c>
+    /// is set (the fix22 config flag):
     /// </para>
+    /// <list type="number">
+    /// <item><see cref="GetSuggestionsAsync"/> -- GETs candidate items from
+    /// a folder; Sonarr's parser auto-populates quality / language / episode
+    /// metadata on each.</item>
+    /// <item><see cref="CommitViaCommandAsync"/> -- POSTs the enriched items
+    /// to <c>/api/v3/command</c> as a <c>ManualImport</c> command. This goes
+    /// through Sonarr's task queue, which IS what publishes
+    /// <c>EpisodeFileImported</c> and <c>SeriesUpdated</c> events to SignalR
+    /// (so the web UI auto-refreshes). The direct
+    /// <c>/api/v3/manualimport</c> POST endpoint imports inline but bypasses
+    /// the event pipeline -- we tried it in fix14-17, hit the UI-refresh
+    /// regression, and switched to the command bus in fix23.</item>
+    /// </list>
     /// <para>
-    /// The scan command imports files from a folder but doesn't link the
-    /// resulting import back to the queue entry it came from. Sonarr's
-    /// Completed Download Handler then keeps the queue tracking entry in a
-    /// stuck 'Waiting to Import / Invalid season or episode' state because
-    /// it never sees a matching import event. Smart queue cleanup (fix19)
-    /// catches this on the back end.
-    /// </para>
-    /// <para>
-    /// <c>manualimport</c> instead accepts <c>downloadId</c> on each item
-    /// (this is what the Manual Import dialog in the Sonarr UI uses) and
-    /// links the import to the queue entry atomically. Faster than scan
-    /// (no filesystem walk), more precise (we tell Sonarr the exact episode
-    /// IDs instead of relying on its parser to extract SxxExx from the
-    /// hardlinked filename), and avoids spinning up storage drives.
+    /// <see cref="GetCommandStatusAsync"/> polls the dispatched command's
+    /// status so the caller knows whether the import actually succeeded
+    /// (fix24) before deleting the queue entry.
     /// </para>
     /// <para>
     /// We treat the response items as opaque <see cref="JObject"/> so we
     /// don't have to model Sonarr's full ManualImportResource shape; we
-    /// just trust the GET output (with downloadId added) and POST it back.
+    /// just trust the GET output (with downloadId / episodeIds added) and
+    /// hand it back to Sonarr.
     /// </para>
     /// </summary>
     internal static class SonarrManualImportShim
@@ -67,32 +70,6 @@ namespace Formulaar1
             var json = await resp.Content.ReadAsStringAsync();
             var arr = JArray.Parse(json);
             return arr.OfType<JObject>().ToList();
-        }
-
-        /// <summary>
-        /// Direct POST to /api/v3/manualimport. Imports inline -- the call
-        /// returns once the files are linked into the library -- but does
-        /// NOT go through Sonarr's command/event pipeline. This was the
-        /// fix14-17 default and was reverted in fix18 because the UI didn't
-        /// auto-refresh after the import (the originating client, which is
-        /// us, doesn't have a browser to self-refresh, and the
-        /// EpisodeFileImported event that would have notified other clients
-        /// over SignalR isn't fired on this endpoint).
-        ///
-        /// Kept here as a fallback / diagnostic option; <see cref="CommitViaCommandAsync"/>
-        /// is the path that triggers SignalR events.
-        /// </summary>
-        public static async Task<(bool Success, string Detail)> CommitAsync(
-            HttpClient http, string basePath, string apiKey, List<JObject> items)
-        {
-            var body = new JArray(items.ToArray()).ToString();
-            var url = $"{basePath.TrimEnd('/')}/api/v3/manualimport";
-            using var req = new HttpRequestMessage(HttpMethod.Post, url);
-            req.Headers.Add("X-Api-Key", apiKey);
-            req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-            using var resp = await http.SendAsync(req);
-            var respBody = await resp.Content.ReadAsStringAsync();
-            return (resp.IsSuccessStatusCode, respBody);
         }
 
         /// <summary>
