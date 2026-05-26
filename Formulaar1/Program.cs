@@ -1,7 +1,6 @@
 using APIv3SonarrDotcore.Api;
 using APIv3SonarrDotcore.Model;
 using Microsoft.AspNetCore.Http.Extensions;
-using Newtonsoft.Json.Linq;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
@@ -68,16 +67,6 @@ namespace Formulaar1
         private static bool bugsnagEnabled = true;
         private static bool enableHardlinking = false;
 
-        // Which Sonarr import path to use after a hardlink succeeds. Added in
-        // fix22 as a feature flag so we can A/B test the atomic manualimport
-        // API (fix14-17 work, reverted in fix18) against the proven
-        // DownloadedEpisodesScan command (fix18-21 current default).
-        // Values: "scan" (default, ships the scan command + smart queue
-        // cleanup) or "manualimport" (POSTs to /api/v3/manualimport + smart
-        // queue cleanup as a backstop). Anything unrecognised falls back to
-        // "scan" so a typo in config can't strand imports.
-        private static string _importMode = "scan";
-
         public static void Main(string[] args)
         {
             using IHost host = Host.CreateDefaultBuilder(args).Build();
@@ -101,22 +90,6 @@ namespace Formulaar1
             bugsnagApiKey = config.GetValue<string>("APICredentials:bugsnag:apiKey");
             Hardlinkpath = config.GetValue<string>("Hardlinkpath");
             enableHardlinking = config.GetValue<bool>("EnableHardlinking");
-
-            // ImportMode: opt-in switch between the proven scan command path
-            // (default) and the atomic manualimport API. Normalised to lower
-            // case so "ScAn" / "ManualImport" / etc. all work, and validated
-            // against the known set -- typos collapse to "scan" with a warning
-            // so misconfiguration never silently disables imports.
-            var importModeRaw = config.GetValue<string>("ImportMode")?.Trim().ToLowerInvariant();
-            if (importModeRaw == "manualimport" || importModeRaw == "scan")
-            {
-                _importMode = importModeRaw;
-            }
-            else if (!string.IsNullOrEmpty(importModeRaw))
-            {
-                Console.WriteLine($"[Config] Unknown ImportMode '{importModeRaw}' -- falling back to 'scan'. Valid values: 'scan', 'manualimport'.");
-            }
-            Console.WriteLine($"[Config] Import mode: {_importMode}");
 
             if (bugsnagEnabled)
             {
@@ -221,12 +194,11 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix26",
+                        version = "v0.5.0-fix27",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
                         hardlinkingEnabled = enableHardlinking,
-                        importMode = _importMode,
                         releasesInQueue = _hashes.Count,
                     };
                     context.Response.StatusCode = 200;
@@ -472,77 +444,26 @@ namespace Formulaar1
         }
 
         /// <summary>
-        /// Tells Sonarr to import the hardlinked file, then runs the smart
-        /// queue cleanup. Dispatches between two import paths based on the
-        /// <c>ImportMode</c> config flag (fix22):
-        ///
-        /// <list type="bullet">
-        /// <item>
-        ///   <term><c>scan</c> (default)</term>
-        ///   <description>Issues a <c>DownloadedEpisodesScan</c> command.
-        ///   Goes through Sonarr's normal import pipeline -- fires
-        ///   EpisodeFileImported events, pushes SignalR notifications to the
-        ///   web UI, updates Episode.HasFile so the series page reflects the
-        ///   imported file without manual refresh. Proven path; what fix18-21
-        ///   shipped as the only option.</description>
-        /// </item>
-        /// <item>
-        ///   <term><c>manualimport</c></term>
-        ///   <description>POSTs to <c>/api/v3/manualimport</c>. Faster (no
-        ///   filesystem scan), more precise (we tell Sonarr exact episode
-        ///   IDs instead of relying on its parser to extract SxxExx from the
-        ///   hardlinked filename), and avoids spinning up storage drives.
-        ///   Tried in fix14-17 and reverted in fix18 due to a "no UI update
-        ///   without manual refresh" regression that was never root-caused --
-        ///   reintroduced as opt-in in fix22 to A/B test whether that
-        ///   regression was actually caused by the aggressive DELETE timing
-        ///   from fix12-17 (since fixed by fix19's smart cleanup).</description>
-        /// </item>
-        /// </list>
+        /// Tells Sonarr to import the hardlinked file via the
+        /// <c>DownloadedEpisodesScan</c> command, then runs the smart queue
+        /// cleanup pass to remove any stuck queue entry Sonarr's CDH left
+        /// behind.
         ///
         /// <para>
-        /// Both paths share the same smart queue cleanup (fix19):
-        /// after the import action, wait 30s for Sonarr's polling to settle,
-        /// then DELETE only queue entries Sonarr has flagged as stuck
-        /// (errorMessage set or trackedDownloadStatus = warning/error).
-        /// Healthy entries are left alone for Sonarr's own lifecycle to
-        /// resolve.
+        /// History note (kept for future readers): fix22-25 added an opt-in
+        /// "manualimport" mode that dispatched <c>/api/v3/command</c> with
+        /// <c>name="ManualImport"</c> instead of the scan command. The
+        /// intent was atomic queue clearing and tighter feedback, but in
+        /// practice the manualimport handler registered files in-place when
+        /// the staging dir was inside the series root (which is the
+        /// natural F1 setup) and never relocated them to <c>Season YYYY/</c>
+        /// nor applied Sonarr's rename. Files landed in a stray subfolder
+        /// with our staging filename. The scan command path goes through
+        /// Sonarr's full CDH pipeline, which moves+renames the file
+        /// correctly, so manualimport was reverted in fix27.
         /// </para>
         /// </summary>
         private static async Task ImportViaSonarr(string hardpath, string infoHash, string torrentName)
-        {
-            if (_importMode == "manualimport")
-            {
-                // fix24: ImportViaManualImportApi owns its own queue cleanup on
-                // the happy path -- it polls the command to completion and
-                // DELETEs the queue entry synchronously when Sonarr reports
-                // success.
-                //
-                // fix25: but if anything goes wrong (HTTP error, command
-                // result=unsuccessful, polling timeout, no importable
-                // suggestions, exception), it returns false and we still need
-                // the 30s smart cleanup so stuck queue entries don't get
-                // orphaned. The file is on disk either way (hardlink happened
-                // before dispatch), the fallback just makes Sonarr's view
-                // consistent.
-                var handled = await ImportViaManualImportApi(hardpath, infoHash);
-                if (!handled)
-                {
-                    await CleanupSonarrQueue(infoHash);
-                }
-            }
-            else
-            {
-                await ImportViaScanCommand(hardpath, torrentName);
-                // Scan mode has no per-file completion signal (DownloadedEpisodesScan
-                // is a folder operation that doesn't surface per-file results), so
-                // we fall back to the timed smart cleanup which catches CDH's
-                // warning-state entry after the scan has had time to land.
-                await CleanupSonarrQueue(infoHash);
-            }
-        }
-
-        private static async Task ImportViaScanCommand(string hardpath, string torrentName)
         {
             var commandResource = new CommandResource
             {
@@ -552,253 +473,15 @@ namespace Formulaar1
             };
             await _commandApi!.ApiV3CommandPostAsync(commandResource);
             Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrentName} for path \"{commandResource.Path}\"");
+
+            // Smart queue cleanup (fix19, retained in fix27 as the only
+            // post-import action). DownloadedEpisodesScan has no per-file
+            // completion signal, so we wait 30s for Sonarr's polling to
+            // settle, then DELETE queue entries CDH left in a stuck
+            // warning/error state.
+            await CleanupSonarrQueue(infoHash);
         }
 
-        /// <summary>
-        /// Atomic import via <c>/api/v3/manualimport</c>. Two-step flow:
-        /// <list type="number">
-        /// <item>GET candidates from the folder. We deliberately omit
-        ///   downloadId here -- fix15 testing showed Sonarr filters to 0
-        ///   results when downloadId is set on a folder that isn't qBit's
-        ///   download path. See SonarrManualImportShim docs.</item>
-        /// <item>For each candidate Sonarr didn't reject: promote nested
-        ///   series.id and episodes[].id to flat top-level seriesId and
-        ///   episodeIds (fix17 lesson -- the POST handler reads flat fields
-        ///   and defaults the missing ones to 0, yielding
-        ///   "Series ID 0 does not exist" if we don't promote). Attach
-        ///   downloadId and importMode=auto, then POST the batch back.</item>
-        /// </list>
-        /// Any failure here falls through to the smart cleanup, which catches
-        /// the queue entry on the warning/error path -- the file is still
-        /// on disk from the hardlink either way.
-        /// </summary>
-        /// <summary>
-        /// Returns <c>true</c> only if the import succeeded AND we synchronously
-        /// deleted the queue entry (fix24's happy path). Returns <c>false</c> on
-        /// any failure -- HTTP error on GET/POST, no importable suggestions,
-        /// command id missing, command polling timeout, command result
-        /// unsuccessful, or exceptions. fix25: the caller (ImportViaSonarr)
-        /// uses this signal to decide whether to run the 30s fallback cleanup
-        /// so stuck queue entries from failed imports don't get orphaned.
-        /// </summary>
-        private static async Task<bool> ImportViaManualImportApi(string hardpath, string infoHash)
-        {
-            try
-            {
-                var suggestions = await SonarrManualImportShim.GetSuggestionsAsync(
-                    _httpClient, BaseSonarPath!, SonarApiKey!, hardpath);
-                Console.WriteLine($"[ManualImport] GET returned {suggestions.Count} suggestion(s) for {hardpath}");
-
-                var importable = new List<JObject>();
-                foreach (var item in suggestions)
-                {
-                    // Sonarr flags rejected items (wrong quality profile, existing
-                    // higher-scoring file, etc.) with a non-empty rejections array.
-                    // Log the reasons but skip POSTing them back.
-                    var rejections = item["rejections"] as JArray;
-                    if (rejections != null && rejections.Count > 0)
-                    {
-                        var reasons = string.Join("; ",
-                            rejections.Select(r => r["reason"]?.ToString() ?? "(unspecified)"));
-                        Console.WriteLine($"[ManualImport] Skipping rejected item '{item["name"]}': {reasons}");
-                        continue;
-                    }
-
-                    // fix17: Sonarr's handler reads flat seriesId and episodeIds.
-                    // The nested series.id and episodes[].id in the GET response are
-                    // informational; missing flat fields default to 0 and the import
-                    // fails with "Series with ID 0 does not exist."
-                    var nestedSeriesId = item["series"]?["id"]?.Value<int?>();
-                    if (nestedSeriesId.HasValue)
-                        item["seriesId"] = nestedSeriesId.Value;
-
-                    if (item["episodes"] is JArray episodesArr)
-                    {
-                        var episodeIdArr = new JArray(
-                            episodesArr.Select(e => e["id"])
-                                       .Where(id => id != null && id.Type != JTokenType.Null)
-                                       .ToArray());
-                        item["episodeIds"] = episodeIdArr;
-                    }
-
-                    // fix24: ALWAYS derive folderName from path (don't trust Sonarr's
-                    // GET-response value). Empirical: Sonarr returns folderName as a
-                    // BARE name like "Formula 1 - S2026E34" (relative), but the
-                    // command-bus ManualImportCommand needs the absolute directory.
-                    // Overwrite unconditionally with Path.GetDirectoryName(item.path),
-                    // which IS absolute since we GET the folder we know to be absolute.
-                    {
-                        var path = item["path"]?.ToString();
-                        if (!string.IsNullOrEmpty(path))
-                        {
-                            var folder = Path.GetDirectoryName(path);
-                            if (!string.IsNullOrEmpty(folder))
-                                item["folderName"] = folder;
-                        }
-                    }
-
-                    // downloadId on each item links the import event back to the
-                    // queue entry from the original release-push so Sonarr can
-                    // clear queue tracking as a side effect of the import.
-                    item["downloadId"] = infoHash;
-                    item["importMode"] = "auto";
-
-                    // quality / languages / releaseGroup / indexerFlags / customFormats
-                    // are already populated on the GET response items by Sonarr's parser
-                    // -- we don't need to fabricate them, just let them ride through the
-                    // POST as-is. Log what we have so the next failure is debuggable.
-                    var qualityName = item["quality"]?["quality"]?["name"]?.ToString() ?? "<none>";
-                    var langs = item["languages"] is JArray langArr
-                        ? string.Join(",", langArr.Select(l => l["name"]?.ToString() ?? "?"))
-                        : "<none>";
-                    var releaseGroup = item["releaseGroup"]?.ToString() ?? "<none>";
-                    Console.WriteLine($"[ManualImport] Item enriched: seriesId={item["seriesId"]} episodeIds={item["episodeIds"]} quality='{qualityName}' languages='{langs}' releaseGroup='{releaseGroup}' folderName='{item["folderName"]}'");
-
-                    importable.Add(item);
-                }
-
-                if (importable.Count == 0)
-                {
-                    Console.WriteLine($"[ManualImport] No importable suggestions ({suggestions.Count} total, all rejected or unparseable). Falling back to smart cleanup pass.");
-                    return false;
-                }
-
-                // Dispatch via the command bus (/api/v3/command) so Sonarr fires
-                // EpisodeFileImported / SeriesUpdated SignalR events (fix23). Returns
-                // the command id, which fix24 uses to poll for completion.
-                var dispatch = await SonarrManualImportShim.CommitViaCommandAsync(
-                    _httpClient, BaseSonarPath!, SonarApiKey!, importable);
-                if (!dispatch.Success)
-                {
-                    var snippet = dispatch.Detail.Length > 200 ? dispatch.Detail.Substring(0, 200) + "..." : dispatch.Detail;
-                    Console.WriteLine($"[ManualImport] Command-bus POST returned non-success: {snippet}. Falling back to smart cleanup pass.");
-                    return false;
-                }
-
-                Console.WriteLine($"[ManualImport] Dispatched ManualImport command (id={dispatch.CommandId?.ToString() ?? "<unknown>"}) for {importable.Count} file(s)");
-
-                if (dispatch.CommandId is not int cmdId)
-                {
-                    Console.WriteLine($"[ManualImport] Command id missing from dispatch response; falling back to smart cleanup pass");
-                    return false;
-                }
-
-                // fix24: poll the command to completion so we know whether the
-                // import actually succeeded -- instead of inferring from "cleanup
-                // found a warning queue entry, must have worked." Caps at ~30s of
-                // polling at 1s intervals; if Sonarr is still chewing on it after
-                // that we move on and let smart cleanup mop up.
-                var commandSucceeded = await PollCommandToCompletion(cmdId, maxWaitSeconds: 30);
-                if (!commandSucceeded)
-                {
-                    // Polling already logged status/exception. Fall back to the
-                    // smart cleanup so any stuck queue entry doesn't get
-                    // orphaned -- the file is on disk either way (we hardlinked
-                    // before dispatch), the cleanup just makes Sonarr's view
-                    // consistent.
-                    return false;
-                }
-
-                // fix24: race CDH for the queue DELETE. When we delete the
-                // queue entry IMMEDIATELY after our import succeeds, we beat
-                // (or at least quickly clear) Sonarr's CDH from flipping the
-                // tracked download into the sticky "warning" state. Net UX:
-                // queue transitions downloading -> (deleted) without the
-                // intervening "failed/warning" flash the user saw before.
-                await DeleteQueueEntryForDownload(infoHash, reason: "ManualImport command succeeded");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ManualImport] Failed: {ex.Message}. Falling back to smart cleanup pass.");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Polls GET /api/v3/command/{id} every second until the command reports
-        /// an ended state (completed/failed/aborted/cancelled/orphaned) or the
-        /// cap elapses. Logs the result with Sonarr's own exception text when
-        /// available -- way more useful for debugging than our previous
-        /// "must have worked because the queue is in warning" inference.
-        ///
-        /// Returns true only when status="completed" AND result="successful".
-        /// </summary>
-        private static async Task<bool> PollCommandToCompletion(int commandId, int maxWaitSeconds)
-        {
-            var deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
-            while (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(1000);
-                try
-                {
-                    var status = await SonarrManualImportShim.GetCommandStatusAsync(
-                        _httpClient, BaseSonarPath!, SonarApiKey!, commandId);
-                    if (status == null) continue; // transient HTTP error -- keep polling
-                    if (!status.IsEnded) continue;
-
-                    if (status.Status == "completed" && string.Equals(status.Result, "successful", StringComparison.OrdinalIgnoreCase))
-                    {
-                        Console.WriteLine($"[ManualImport] Command {commandId} completed successfully");
-                        return true;
-                    }
-
-                    // Some terminal state that isn't "successful" -- surface
-                    // whatever detail Sonarr gave us.
-                    var exception = string.IsNullOrWhiteSpace(status.Exception)
-                        ? "(no exception text)"
-                        : status.Exception;
-                    Console.WriteLine($"[ManualImport] Command {commandId} ended with status='{status.Status}' result='{status.Result}' exception={exception}");
-                    return false;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[ManualImport] Error polling command {commandId}: {ex.Message}");
-                    // Don't return immediately on transient errors -- the command
-                    // is probably still running fine, we just couldn't read its
-                    // status this tick.
-                }
-            }
-
-            Console.WriteLine($"[ManualImport] Command {commandId} didn't finish within {maxWaitSeconds}s -- moving on, smart cleanup pass will tidy up");
-            return false;
-        }
-
-        /// <summary>
-        /// Unconditional DELETE of any queue entry matching the given downloadId.
-        /// Used by fix24 after a confirmed-successful ManualImport to race CDH's
-        /// warning-flip. removeFromClient=false so qBit keeps seeding for ratio;
-        /// blocklist=false so the indexer doesn't get a strike.
-        /// </summary>
-        private static async Task DeleteQueueEntryForDownload(string infoHash, string reason)
-        {
-            try
-            {
-                var queue = await SonarrQueueShim.GetByDownloadIdAsync(_httpClient, BaseSonarPath!, SonarApiKey!, infoHash);
-                if (queue.Count == 0)
-                {
-                    // Could mean Sonarr already cleared it (ManualImport's
-                    // tracked-download linkage worked perfectly), or the queue
-                    // entry never existed (Sonarr's polling hadn't caught the
-                    // download yet). Either way, nothing to do.
-                    Console.WriteLine($"[Hardlinking] No queue item to delete for {infoHash} (reason: {reason})");
-                    return;
-                }
-                foreach (var q in queue)
-                {
-                    if (q.Id is int qid)
-                    {
-                        await SonarrQueueShim.DeleteAsync(_httpClient, BaseSonarPath!, SonarApiKey!,
-                            qid, removeFromClient: false, blocklist: false);
-                        Console.WriteLine($"[Hardlinking] Deleted queue item {qid} (reason: {reason}; status was {q.TrackedDownloadStatus}/{q.TrackedDownloadState})");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[Hardlinking] Queue delete failed (file is imported either way): {ex.Message}");
-            }
-        }
 
         /// <summary>
         /// Smart queue cleanup (fix19, extracted into a helper in fix22).
