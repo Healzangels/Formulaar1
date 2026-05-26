@@ -26,6 +26,12 @@ namespace Formulaar1
             public string? DownloadId { get; set; }
             public string? Title { get; set; }
             public string? Status { get; set; }
+            // Added in fix19 to support conditional cleanup: only DELETE entries
+            // Sonarr has flagged as stuck/errored, leave healthy entries for
+            // Sonarr to manage on its own lifecycle.
+            public string? TrackedDownloadStatus { get; set; }
+            public string? TrackedDownloadState { get; set; }
+            public string? ErrorMessage { get; set; }
         }
 
         public sealed class MinimalQueuePage

@@ -1,7 +1,6 @@
 using APIv3SonarrDotcore.Api;
 using APIv3SonarrDotcore.Model;
 using Microsoft.AspNetCore.Http.Extensions;
-using QBittorrent.Client;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
@@ -22,7 +21,10 @@ namespace Formulaar1
         // on the abandoned APIv3SonarrDotcore deserialiser for read paths.
         private static HttpClient _httpClient = new();
 
-        private static QBittorrentClient? _qBittorrentClient;
+        // qBit session cookie (SID), populated by QBittorrentShim.LoginAsync at
+        // startup. Replaces the QBittorrent.Client SDK which couldn't handle
+        // qBit 5.0+ state enum changes (stoppedDL etc.) -- see QBittorrentShim.cs.
+        private static string? _qBitSid;
 
         // Releases accepted by Sonarr and awaiting qBit completion. Keyed by
         // Title (the rewritten one we set in the release-push handler, unique
@@ -119,10 +121,19 @@ namespace Formulaar1
                 if (TorrentClient == "qBittorrent" && qBitUsername != null && qBitPassword != null)
                 {
                     Console.WriteLine($"Detected qBittorrent Client, attempting to login");
-                    _qBittorrentClient = new QBittorrentClient(new Uri(BaseqBitPath!));
-                    _qBittorrentClient.LoginAsync(qBitUsername, qBitPassword).GetAwaiter().GetResult();
-                    var result = _qBittorrentClient.GetQBittorrentVersionAsync().GetAwaiter().GetResult();
-                    Console.WriteLine($"Logged in to {result}");
+                    // Direct HTTP via QBittorrentShim (replaces the abandoned
+                    // QBittorrent.Client SDK which couldn't deserialise qBit
+                    // 5.0's new state names like 'stoppedDL').
+                    _qBitSid = QBittorrentShim.LoginAsync(_httpClient, BaseqBitPath!, qBitUsername, qBitPassword).GetAwaiter().GetResult();
+                    if (_qBitSid == null)
+                    {
+                        Console.WriteLine("!!  qBit login failed -- check qBittorrentClient username/password/BasePath in appsettings.json !!");
+                    }
+                    else
+                    {
+                        var ver = QBittorrentShim.GetVersionAsync(_httpClient, BaseqBitPath!, _qBitSid).GetAwaiter().GetResult();
+                        Console.WriteLine($"Logged in to {ver}");
+                    }
                 }
                 else
                 {
@@ -172,7 +183,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix19-debug",
+                        version = "v0.5.0-fix19",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -456,37 +467,50 @@ namespace Formulaar1
             await _commandApi!.ApiV3CommandPostAsync(commandResource);
             Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrentName} for path \"{commandResource.Path}\"");
 
-            // === fix19-debug: queue cleanup intentionally SKIPPED ===
-            // We're testing whether Sonarr's queue tracking works naturally on
-            // its own (showing the download lifecycle in the queue tab) without
-            // our DELETE call interfering. If you see stuck "Waiting to Import"
-            // entries after this test, that's the OLD behaviour resurfacing --
-            // click the X in Sonarr's queue tab to clear them manually.
-            Console.WriteLine($"[Hardlinking] (fix19-debug) Skipping queue cleanup for {infoHash} -- observing Sonarr's native queue behaviour. Stuck queue entries may need manual clearing.");
-            /*
+            // Smart queue cleanup (fix19):
+            //
+            // Wait long enough for Sonarr's polling cycle (default ~60s) to have
+            // populated the queue and for its CDH to have attempted import. THEN
+            // only DELETE entries Sonarr has flagged as stuck (errorMessage set
+            // or trackedDownloadStatus = warning/error). Healthy queue entries
+            // are left alone -- Sonarr will clean them up via its own lifecycle
+            // when it can.
+            //
+            // Result: during the download window, the user sees the queue entry
+            // populate naturally (visibility win), and after our scan succeeds
+            // we only intervene if CDH got stuck (no manual cleanup needed).
             try
             {
-                await Task.Delay(5000);
+                // 30s lets Sonarr's first poll happen and CDH attempt import.
+                await Task.Delay(30000);
                 var stale = await SonarrQueueShim.GetByDownloadIdAsync(_httpClient, BaseSonarPath!, SonarApiKey!, infoHash);
+                if (stale.Count == 0)
+                {
+                    Console.WriteLine($"[Hardlinking] No queue item left for {infoHash} -- Sonarr cleared it naturally");
+                }
                 foreach (var q in stale)
                 {
-                    if (q.Id is int qid)
+                    bool isStuck =
+                        !string.IsNullOrEmpty(q.ErrorMessage) ||
+                        string.Equals(q.TrackedDownloadStatus, "warning", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(q.TrackedDownloadStatus, "error", StringComparison.OrdinalIgnoreCase);
+
+                    if (isStuck && q.Id is int qid)
                     {
                         await SonarrQueueShim.DeleteAsync(_httpClient, BaseSonarPath!, SonarApiKey!,
                             qid, removeFromClient: false, blocklist: false);
-                        Console.WriteLine($"[Hardlinking] Removed stale Sonarr queue item {qid} ('{q.Title}') -- file already imported via scan");
+                        Console.WriteLine($"[Hardlinking] Removed stuck Sonarr queue item {qid} (status: {q.TrackedDownloadStatus}, err: {q.ErrorMessage}). File already imported via scan.");
                     }
-                }
-                if (stale.Count == 0)
-                {
-                    Console.WriteLine($"[Hardlinking] No matching queue item to clean up for {infoHash} (Sonarr may have already cleared it)");
+                    else
+                    {
+                        Console.WriteLine($"[Hardlinking] Queue item {q.Id} for {infoHash} looks healthy (status: {q.TrackedDownloadStatus}/{q.TrackedDownloadState}); leaving for Sonarr to manage");
+                    }
                 }
             }
             catch (Exception cleanupEx)
             {
                 Console.WriteLine($"[Hardlinking] Queue cleanup failed (file is imported anyway): {cleanupEx.Message}");
             }
-            */
         }
 
         private static async void _checkEvents(object? sender, System.Timers.ElapsedEventArgs e)
@@ -599,8 +623,17 @@ namespace Formulaar1
                     {
                         try
                         {
-                            var query = new TorrentListQuery() { Hashes = new string[] { r.InfoHash } };
-                            var result = await _qBittorrentClient!.GetTorrentListAsync(query);
+                            // Go through QBittorrentShim instead of the bundled SDK so
+                            // qBit's new state names (stoppedDL etc., qBit 5.0+) don't
+                            // crash the deserialiser. The shim treats state as a raw
+                            // string and only reads the fields the monitor needs.
+                            if (_qBitSid == null)
+                            {
+                                _qBitSid = await QBittorrentShim.LoginAsync(_httpClient, BaseqBitPath!, qBitUsername!, qBitPassword!);
+                            }
+                            var result = _qBitSid != null
+                                ? await QBittorrentShim.GetByHashAsync(_httpClient, BaseqBitPath!, _qBitSid, r.InfoHash)
+                                : new List<QBittorrentShim.MinimalTorrent>();
 
                             // Diagnostic: surface whether qBit has the torrent and
                             // whether it's complete. Both gates were previously silent
@@ -761,10 +794,13 @@ namespace Formulaar1
                             if (looksLikeAuth)
                             {
                                 Console.WriteLine("[Hardlinking] qBit returned auth error -- attempting re-login");
-                                try { await _qBittorrentClient!.LoginAsync(qBitUsername, qBitPassword); }
+                                try
+                                {
+                                    _qBitSid = await QBittorrentShim.LoginAsync(_httpClient, BaseqBitPath!, qBitUsername!, qBitPassword!);
+                                }
                                 catch (Exception loginEx) { Console.WriteLine($"[Hardlinking] Re-login failed: {loginEx.Message}"); }
                             }
-                            Console.WriteLine($"[Hardlinking] qBit error processing '{r.Title}': {ex}");
+                            Console.WriteLine($"[Hardlinking] qBit error processing '{r.Title}': {ex.Message}");
                             if (bugsnagEnabled)
                             {
                                 _bugsnag?.Notify(ex);
