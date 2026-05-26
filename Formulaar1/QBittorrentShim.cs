@@ -71,11 +71,22 @@ namespace Formulaar1
             req.Headers.Referrer = new Uri(baseUrl);
             using var resp = await http.SendAsync(req);
             var body = await resp.Content.ReadAsStringAsync();
-            if (!resp.IsSuccessStatusCode ||
-                body.Contains("Fails", StringComparison.OrdinalIgnoreCase))
+
+            // Diagnostic logging so we can SEE why login failed when it does.
+            // qBit's auth conventions: 200 OK with body "Ok." on success, body
+            // "Fails." on bad credentials, 403 Forbidden if the user/IP is
+            // banned. Some configurations also require Referer matching.
+            if (!resp.IsSuccessStatusCode)
             {
+                Console.WriteLine($"[QBit] Login refused: HTTP {(int)resp.StatusCode} {resp.StatusCode} -- body='{Truncate(body, 200)}'");
                 return null;
             }
+            if (body.Contains("Fails", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"[QBit] Login failed (bad credentials?): body='{Truncate(body, 200)}'");
+                return null;
+            }
+
             if (resp.Headers.TryGetValues("Set-Cookie", out var cookies))
             {
                 foreach (var cookie in cookies)
@@ -83,14 +94,24 @@ namespace Formulaar1
                     if (cookie.StartsWith("SID=", StringComparison.Ordinal))
                     {
                         var semi = cookie.IndexOf(';');
-                        return semi > 0
+                        var sid = semi > 0
                             ? cookie.Substring(4, semi - 4)
                             : cookie.Substring(4);
+                        Console.WriteLine($"[QBit] Login OK, got SID ({sid.Length} chars)");
+                        return sid;
                     }
                 }
+                Console.WriteLine($"[QBit] Login response had Set-Cookie headers but none started with 'SID='. Cookies: {string.Join(" | ", cookies)}");
+            }
+            else
+            {
+                Console.WriteLine($"[QBit] Login succeeded (HTTP 200, body='{Truncate(body, 100)}') but NO Set-Cookie header in response. This usually means HttpClient is configured with UseCookies=true and consuming the cookie -- check the handler config.");
             }
             return null;
         }
+
+        private static string Truncate(string s, int max) =>
+            s.Length <= max ? s : s.Substring(0, max) + "...";
 
         /// <summary>
         /// GET /api/v2/app/version. Returns the qBit version string, or null

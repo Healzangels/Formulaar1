@@ -19,7 +19,14 @@ namespace Formulaar1
         // _episodeApi and _historyApi were here previously but both moved to
         // shims (SonarrEpisodeShim, SonarrHistoryShim) so we no longer depend
         // on the abandoned APIv3SonarrDotcore deserialiser for read paths.
-        private static HttpClient _httpClient = new();
+        // UseCookies=false so Set-Cookie comes through to resp.Headers (needed
+        // by QBittorrentShim's manual session-cookie parse). Default
+        // HttpClientHandler consumes Set-Cookie into a CookieContainer and
+        // doesn't expose it to caller code, which broke qBit login in fix19.
+        // Sonarr API uses X-Api-Key (no cookies), qBit shim manages cookies
+        // manually via Cookie: header, F1API is unauthenticated -- nothing
+        // else in the codebase needs auto-cookies.
+        private static HttpClient _httpClient = new(new SocketsHttpHandler { UseCookies = false });
 
         // qBit session cookie (SID), populated by QBittorrentShim.LoginAsync at
         // startup. Replaces the QBittorrent.Client SDK which couldn't handle
@@ -183,7 +190,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix19",
+                        version = "v0.5.0-fix20",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
