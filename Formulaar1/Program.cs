@@ -16,14 +16,22 @@ namespace Formulaar1
         private static Bugsnag.Client? _bugsnag;
 
         private static SeriesApi? _seriesApi;
-        private static EpisodeApi? _episodeApi;
         private static ReleasePushApi? _releasePushApi;
         private static CommandApi? _commandApi;
+        // _episodeApi and _historyApi were here previously but both moved to
+        // shims (SonarrEpisodeShim, SonarrHistoryShim) so we no longer depend
+        // on the abandoned APIv3SonarrDotcore deserialiser for read paths.
         private static HttpClient _httpClient = new();
 
         private static QBittorrentClient? _qBittorrentClient;
 
-        private static ConcurrentBag<ReleaseResource> _hashes = new ConcurrentBag<ReleaseResource>();
+        // Releases accepted by Sonarr and awaiting qBit completion. Keyed by
+        // Title (the rewritten one we set in the release-push handler, unique
+        // per release). Switched from ConcurrentBag to ConcurrentDictionary in
+        // fix15: the old "_hashes = new Bag(_hashes.Except([r]))" pattern had a
+        // race where a concurrently-added release could land in the soon-to-be-
+        // orphaned old bag. TryAdd/TryRemove on ConcurrentDictionary is atomic.
+        private static ConcurrentDictionary<string, ReleaseResource> _hashes = new();
 
         // Tracks when each release was added to _hashes (keyed by Title). Used by
         // the hardlink monitor to evict stuck entries -- releases that were
@@ -40,7 +48,10 @@ namespace Formulaar1
 
         private static string? TorrentClient, BaseSonarPath, BaseqBitPath, SonarApiKey, qBitUsername, qBitPassword, bugsnagApiKey, Hardlinkpath;
 
-        private static bool running = false;
+        // `running` flag removed in fix15: Timer.AutoReset=false means the timer
+        // is single-fire, the handler runs to completion, and only the handler
+        // itself can reschedule via _timer.Start(). So there's never more than
+        // one in-flight handler -- the manual mutex was dead weight.
         private static bool bugsnagEnabled = true;
         private static bool enableHardlinking = false;
 
@@ -56,7 +67,14 @@ namespace Formulaar1
             qBitUsername = config.GetValue<string>("APICredentials:qBittorrentClient:Username");
             qBitPassword = config.GetValue<string>("APICredentials:qBittorrentClient:Password");
             BaseqBitPath = config.GetValue<string>("APICredentials:qBittorrentClient:BasePath");
-            bugsnagEnabled = config.GetValue<bool>("APICredentials:bugsnag:enabled");
+            // BugSnag telemetry requires BOTH top-level AllowBugSnag AND the
+            // nested enabled flag. Upstream only read the nested flag and
+            // ignored AllowBugSnag entirely, making the top-level toggle
+            // decorative. With this AND-gate, AllowBugSnag is a kill switch
+            // a user can flip to disable telemetry without touching the
+            // nested config.
+            bugsnagEnabled = config.GetValue<bool>("AllowBugSnag") &&
+                             config.GetValue<bool>("APICredentials:bugsnag:enabled");
             bugsnagApiKey = config.GetValue<string>("APICredentials:bugsnag:apiKey");
             Hardlinkpath = config.GetValue<string>("Hardlinkpath");
             enableHardlinking = config.GetValue<bool>("EnableHardlinking");
@@ -80,13 +98,13 @@ namespace Formulaar1
                 Configuration.Default.UserAgent = "Formulaar1";
 
                 _seriesApi = new SeriesApi();
-                _episodeApi = new EpisodeApi();
                 _releasePushApi = new ReleasePushApi();
                 _commandApi = new CommandApi();
-                // _historyApi was here previously but its single call site moved
-                // to SonarrHistoryShim (the bundled client deserialiser chokes on
-                // Sonarr v4's clearlogo). The field/init are gone -- if you ever
-                // need to re-add a history-related Sonarr call, use the shim.
+                // _episodeApi and _historyApi moved to shims (SonarrEpisodeShim,
+                // SonarrHistoryShim) so the bundled APIv3SonarrDotcore client is
+                // only used now for release-push (ReleasePushApi) and triggering
+                // scan commands (CommandApi), neither of which return MediaCover-
+                // tainted payloads. Series is also shimmed via SonarrSeriesShim.
             }
             else
             {
@@ -155,7 +173,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix13",
+                        version = "v0.5.0-fix15",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -248,14 +266,16 @@ namespace Formulaar1
                                         {
                                         Console.WriteLine($"[Sonarr] Resolved series '{Series[0].Title}' for tvdbId {seriesInfo.TvdbId} -> seriesId {Series[0].Id}");
 
-                                        //Get all Episodes
-                                        var tmp = await _episodeApi!.ApiV3EpisodeGetAsync(Series[0].Id);
+                                        //Get all Episodes (via shim so we don't depend on the abandoned SDK
+                                        // deserialiser even for the read paths that haven't yet broken).
+                                        var tmp = await SonarrEpisodeShim.GetBySeriesIdAsync(
+                                            _httpClient, BaseSonarPath!, SonarApiKey!, Series[0].Id);
                                         //Find Correct Year
                                         var tmp1 = tmp.Where(x => x.SeasonNumber == SeasonID);
                                         //Find Correct Country
-                                        var tmp2 = tmp1.Where(x => x.Title.Contains(Country, StringComparison.OrdinalIgnoreCase));
+                                        var tmp2 = tmp1.Where(x => (x.Title ?? string.Empty).Contains(Country, StringComparison.OrdinalIgnoreCase));
                                         //Find correct session episode
-                                        IEnumerable<EpisodeResource> tmp3 = GetEpisodesByShowType(tmp2, seriesInfo.Title, ShowType);
+                                        var tmp3 = GetEpisodesByShowType(tmp2, seriesInfo.Title, ShowType);
 
                                         var Episode = tmp3.FirstOrDefault();
 
@@ -330,13 +350,12 @@ namespace Formulaar1
                                             // comparisons (against qBit's lower-cased Hash field) just
                                             // work. Sonarr returns it upper-cased.
                                             if (!string.IsNullOrEmpty(r.InfoHash)) r.InfoHash = r.InfoHash.ToLower();
-                                            _hashes.Add(r);
-                                            // Stamp the add-time so the monitor can evict releases that
-                                            // never resolve to a completed qBit torrent (qBit dropped
-                                            // the torrent, hash mismatch, etc.). Keyed by Title since
-                                            // that's the one field guaranteed non-null at this point.
                                             if (!string.IsNullOrEmpty(r.Title))
                                             {
+                                                // Atomic add via the dictionary; AddOrUpdate handles the
+                                                // edge case of an exact-same Title being pushed twice
+                                                // (we just refresh the entry, no double-processing).
+                                                _hashes[r.Title] = r;
                                                 _queuedAt[r.Title] = DateTime.UtcNow;
                                             }
                                             if (enableHardlinking && !_timer.Enabled)
@@ -482,6 +501,12 @@ namespace Formulaar1
             // Fallback: classic scan command + post-hoc queue DELETE. Kept as
             // a safety net in case manualimport doesn't apply (Sonarr API
             // change, an edge case in our payload, network blip mid-request).
+            // Worth keeping deliberately even though fix14 has been stable in
+            // testing -- the two paths converge on identical on-disk state;
+            // the fallback only differs in HOW the queue clears (scan + DELETE
+            // vs manualimport's atomic downloadId linkage). If you ever see
+            // the "falling back to scan+cleanup" log line in normal operation
+            // (not "file already in library" edge), investigate before deleting.
             var commandResource = new CommandResource
             {
                 Name = "DownloadedEpisodesScan",
@@ -517,19 +542,21 @@ namespace Formulaar1
 
         private static async void _checkEvents(object? sender, System.Timers.ElapsedEventArgs e)
         {
-            if (!running)
+            // Outer try/finally ensures the timer always reschedules. async void
+            // handlers can swallow exceptions; without the finally any uncaught
+            // throw from the foreach body would silently kill the monitor.
+            // (Note: the upstream `running` flag was redundant since
+            // Timer.AutoReset=false means single-fire; removing it.)
+            try
             {
-                if (_hashes.IsEmpty) { running = false; return; }
-                running = true;
-                Console.WriteLine($"[Hardlinking] Monitor tick: {_hashes.Count} release(s) in queue");
-                ////
-                ///Used to monitor qBit and then Hardlink once the download is complete 
-                ///and will also trigger a media import og the torrent folder in Sonarr.
-                ////
-                ///
+                if (_hashes.IsEmpty) return;
 
-                foreach (var r in _hashes.ToList())
+                Console.WriteLine($"[Hardlinking] Monitor tick: {_hashes.Count} release(s) in queue");
+
+                foreach (var r in _hashes.Values.ToList())
                 {
+                    try
+                    {
                     // Stuck-release eviction. If a release has been in _hashes
                     // for more than 24 hours and never resolved, something's
                     // genuinely wrong (qBit dropped the torrent, hash mismatch
@@ -540,7 +567,7 @@ namespace Formulaar1
                         (DateTime.UtcNow - queuedAt).TotalHours > 24)
                     {
                         Console.WriteLine($"[Hardlinking] Evicting stuck release after >24h: '{r.Title}' (never resolved to a completed qBit torrent). Check qBit and Sonarr connectivity.");
-                        _hashes = new ConcurrentBag<ReleaseResource>(_hashes.Except(new[] { r }));
+                        _hashes.TryRemove(r.Title, out _);
                         _queuedAt.TryRemove(r.Title, out _);
                         continue;
                     }
@@ -612,8 +639,11 @@ namespace Formulaar1
                         {
                             Console.WriteLine($"[Hardlinking] History lookup failed for '{r.Title}': {ex.Message}");
                         }
-
-                        await Task.Delay(1000);
+                        // (Vestigial 1-second Task.Delay removed in fix15. It was
+                        // there in upstream to let Sonarr's history register a
+                        // grab between retries, but with the SxxExx+UTC matcher
+                        // from fix7 we now find recent grabs reliably without
+                        // sleep loops.)
                     }
 
                     if (r.InfoHash != null)
@@ -645,13 +675,12 @@ namespace Formulaar1
                                 var torrent = result.FirstOrDefault();
                                 if (torrent != null && torrent.CompletionOn != null)
                                 {
-                                    // Case-insensitive match: Sonarr's push response gives InfoHash
-                                    // in UPPER case (preserved from the source), qBit's response
-                                    // gives Hash in lower case. The original equality silently fails
-                                    // every tick and sonarrItem stays null -- the hardlink branch
-                                    // never runs even though the download is complete.
-                                    var sonarrItem = _hashes.Where(x => string.Equals(x.InfoHash, torrent.Hash, StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
-                                    if (sonarrItem != null)
+                                    // We're already iterating the release that owns this InfoHash --
+                                    // the upstream re-lookup against _hashes by torrent.Hash was
+                                    // doing the same thing (and had a case-sensitivity bug fix9
+                                    // patched). With the ConcurrentDictionary migration in fix15
+                                    // we can just use `r` directly: it IS the matched release.
+                                    var sonarrItem = r;
                                     {
                                         FileAttributes attr = File.GetAttributes(Path.Combine(torrent.SavePath!, torrent.Name!));
 
@@ -754,9 +783,13 @@ namespace Formulaar1
                                         // DownloadedEpisodesScan + DELETE path on failure.
                                         await ImportViaSonarr(hardpathcomplete, sonarrItem.InfoHash!, torrent.Name!);
 
-                                        _hashes = new ConcurrentBag<ReleaseResource>(_hashes.Except(new[] { r }));
+                                        // Atomic remove via the dictionary -- no reassignment race
+                                        // (the upstream "new Bag(Except [r])" pattern could drop a
+                                        // concurrently-added release into the soon-to-be-orphaned
+                                        // old bag).
                                         if (!string.IsNullOrEmpty(r.Title))
                                         {
+                                            _hashes.TryRemove(r.Title, out _);
                                             _queuedAt.TryRemove(r.Title, out _);
                                         }
                                         if (_hashes.IsEmpty) Console.WriteLine("[Hardlinking] Queue empty — monitor idle.");
@@ -766,21 +799,52 @@ namespace Formulaar1
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine("Attempting Simple Reauth to torrent Client");
-
-                            await _qBittorrentClient!.LoginAsync(qBitUsername, qBitPassword);
-
-                            Console.WriteLine(ex.ToString());
+                            // Selective reauth: only re-login on errors that look like
+                            // session/auth failures. The upstream code blindly re-logged
+                            // on every exception, which is wasteful (network blips, malformed
+                            // responses, etc. all triggered an unnecessary login round-trip)
+                            // and could mask the original error under a follow-up auth failure.
+                            var msg = ex.Message ?? string.Empty;
+                            bool looksLikeAuth =
+                                msg.Contains("401") || msg.Contains("403") ||
+                                msg.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase) ||
+                                msg.Contains("Forbidden", StringComparison.OrdinalIgnoreCase);
+                            if (looksLikeAuth)
+                            {
+                                Console.WriteLine("[Hardlinking] qBit returned auth error -- attempting re-login");
+                                try { await _qBittorrentClient!.LoginAsync(qBitUsername, qBitPassword); }
+                                catch (Exception loginEx) { Console.WriteLine($"[Hardlinking] Re-login failed: {loginEx.Message}"); }
+                            }
+                            Console.WriteLine($"[Hardlinking] qBit error processing '{r.Title}': {ex}");
                             if (bugsnagEnabled)
                             {
                                 _bugsnag?.Notify(ex);
                             }
                         }
                     }
+                    } // closes per-release try
+                    catch (Exception perReleaseEx)
+                    {
+                        // Final safety net for anything thrown OUTSIDE the inner try
+                        // blocks (Path.Combine on weird input, DirectoryNotFoundException
+                        // on missing share, etc.). Logs and moves to next release rather
+                        // than letting one bad entry kill the whole monitor.
+                        Console.WriteLine($"[Hardlinking] Unexpected error processing '{r.Title}': {perReleaseEx.Message}");
+                    }
                 }
-                running = false;
+            }
+            catch (Exception outerEx)
+            {
+                Console.WriteLine($"[Hardlinking] Monitor tick crashed: {outerEx.Message}");
+            }
+            finally
+            {
+                // Always reschedule if there's still work. The finally block makes
+                // sure an exception anywhere above can't strand the timer.
                 if (!_hashes.IsEmpty)
-                    _timer.Start();
+                {
+                    try { _timer.Start(); } catch { /* timer disposed during shutdown */ }
+                }
             }
         }
 

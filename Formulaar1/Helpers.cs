@@ -70,25 +70,28 @@ namespace Formulaar1
 
         /// <summary>
         /// Filters episodes by ShowType, applying series-specific logic for F1 vs F2/F3.
+        /// Takes the shim's MinimalEpisode rather than the SDK's EpisodeResource so
+        /// the entire pipeline runs through our shimmed deserialisers and Helpers
+        /// doesn't need a reference to the abandoned APIv3SonarrDotcore client.
         /// </summary>
-        internal static IEnumerable<EpisodeResource> GetEpisodesByShowType(
-            IEnumerable<EpisodeResource> candidates, string seriesTitle, string showType)
+        internal static IEnumerable<SonarrEpisodeShim.MinimalEpisode> GetEpisodesByShowType(
+            IEnumerable<SonarrEpisodeShim.MinimalEpisode> candidates, string seriesTitle, string showType)
         {
             bool isF1 = seriesTitle.Equals("Formula 1", StringComparison.OrdinalIgnoreCase);
 
             return showType switch
             {
                 "Sprint Shootout" when isF1 =>
-                    candidates.Where(x => x.Title.Contains("Shootout", StringComparison.OrdinalIgnoreCase) ||
-                                          x.Title.Contains("Sprint Qualifying", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Shootout", StringComparison.OrdinalIgnoreCase) ||
+                                          (x.Title ?? string.Empty).Contains("Sprint Qualifying", StringComparison.OrdinalIgnoreCase)),
 
                 "Sprint Race" when isF1 =>
-                    candidates.Where(x => x.Title.Contains("Sprint", StringComparison.OrdinalIgnoreCase) &&
-                                          !x.Title.Contains("Shootout", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Sprint", StringComparison.OrdinalIgnoreCase) &&
+                                          !(x.Title ?? string.Empty).Contains("Shootout", StringComparison.OrdinalIgnoreCase)),
 
                 "Sprint" when isF1 =>
-                    candidates.Where(x => x.Title.Contains("Sprint", StringComparison.OrdinalIgnoreCase) &&
-                                          !x.Title.Contains("Shootout", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Sprint", StringComparison.OrdinalIgnoreCase) &&
+                                          !(x.Title ?? string.Empty).Contains("Shootout", StringComparison.OrdinalIgnoreCase)),
 
                 // F1 "Race" must exclude Sprint Race and Feature Race episodes.
                 // The default `_ =>` branch below would otherwise match "Sprint Race"
@@ -96,31 +99,31 @@ namespace Formulaar1
                 // sprint weekend pulls the lower-numbered Sprint Race episode
                 // instead of the main Race.
                 "Race" when isF1 =>
-                    candidates.Where(x => x.Title.Contains("Race", StringComparison.OrdinalIgnoreCase) &&
-                                          !x.Title.Contains("Sprint Race", StringComparison.OrdinalIgnoreCase) &&
-                                          !x.Title.Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Race", StringComparison.OrdinalIgnoreCase) &&
+                                          !(x.Title ?? string.Empty).Contains("Sprint Race", StringComparison.OrdinalIgnoreCase) &&
+                                          !(x.Title ?? string.Empty).Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
 
                 // Same shape for Qualifying: the TVDB sprint-weekend episode list
                 // contains both "Qualifying" and "Sprint Qualifying", and the default
                 // Contains() match would grab the lower-numbered Sprint Qualifying.
                 "Qualifying" when isF1 =>
-                    candidates.Where(x => x.Title.Contains("Qualifying", StringComparison.OrdinalIgnoreCase) &&
-                                          !x.Title.Contains("Sprint Qualifying", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Qualifying", StringComparison.OrdinalIgnoreCase) &&
+                                          !(x.Title ?? string.Empty).Contains("Sprint Qualifying", StringComparison.OrdinalIgnoreCase)),
 
                 "Sprint Race" =>
-                    candidates.Where(x => x.Title.Contains("Sprint Race", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Sprint Race", StringComparison.OrdinalIgnoreCase)),
 
                 "Sprint" =>
-                    candidates.Where(x => x.Title.Contains("Sprint Race", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Sprint Race", StringComparison.OrdinalIgnoreCase)),
 
                 "Feature Race" =>
-                    candidates.Where(x => x.Title.Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
 
                 "Race" when !isF1 =>
-                    candidates.Where(x => x.Title.Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains("Feature Race", StringComparison.OrdinalIgnoreCase)),
 
                 _ =>
-                    candidates.Where(x => x.Title.Contains(showType, StringComparison.OrdinalIgnoreCase)),
+                    candidates.Where(x => (x.Title ?? string.Empty).Contains(showType, StringComparison.OrdinalIgnoreCase)),
             };
         }
 
