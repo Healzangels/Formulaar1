@@ -194,7 +194,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix27",
+                        version = "v0.5.0-fix28",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -511,7 +511,7 @@ namespace Formulaar1
                     {
                         await SonarrQueueShim.DeleteAsync(_httpClient, BaseSonarPath!, SonarApiKey!,
                             qid, removeFromClient: false, blocklist: false);
-                        Console.WriteLine($"[Hardlinking] Removed stuck Sonarr queue item {qid} (status: {q.TrackedDownloadStatus}, err: {q.ErrorMessage}). File already imported via {_importMode}.");
+                        Console.WriteLine($"[Hardlinking] Removed stuck Sonarr queue item {qid} (status: {q.TrackedDownloadStatus}, err: {q.ErrorMessage}). File already imported via scan.");
                     }
                     else
                     {
