@@ -121,7 +121,20 @@ namespace Formulaar1
         /// derives <c>folderName</c> from <c>path</c>.
         /// </para>
         /// </summary>
-        public static async Task<(bool Success, string Detail)> CommitViaCommandAsync(
+        /// <summary>
+        /// Result of dispatching the ManualImport command. <see cref="CommandId"/>
+        /// is populated when Sonarr accepts the POST and returns the queued
+        /// command resource; null on failure (the body is in <see cref="Detail"/>).
+        /// Callers use <see cref="GetCommandStatusAsync"/> to poll to completion.
+        /// </summary>
+        public sealed class CommandDispatchResult
+        {
+            public bool Success { get; init; }
+            public int? CommandId { get; init; }
+            public string Detail { get; init; } = string.Empty;
+        }
+
+        public static async Task<CommandDispatchResult> CommitViaCommandAsync(
             HttpClient http, string basePath, string apiKey, List<JObject> items, string importMode = "auto")
         {
             var payload = new JObject
@@ -136,7 +149,81 @@ namespace Formulaar1
             req.Content = new StringContent(payload.ToString(), System.Text.Encoding.UTF8, "application/json");
             using var resp = await http.SendAsync(req);
             var respBody = await resp.Content.ReadAsStringAsync();
-            return (resp.IsSuccessStatusCode, respBody);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                return new CommandDispatchResult { Success = false, Detail = respBody };
+            }
+
+            // Sonarr returns the queued CommandResource: { "id": 12345, "name":
+            // "ManualImport", "status": "queued", ... }. Extract the id so the
+            // caller can poll for completion.
+            int? cmdId = null;
+            try
+            {
+                var parsed = JObject.Parse(respBody);
+                cmdId = parsed["id"]?.Value<int?>();
+            }
+            catch
+            {
+                // Body wasn't JSON we could parse; treat as success-without-id
+                // (caller will fall back to the legacy timed cleanup path).
+            }
+            return new CommandDispatchResult { Success = true, CommandId = cmdId, Detail = respBody };
+        }
+
+        /// <summary>
+        /// Status of a Sonarr command, as returned by GET /api/v3/command/{id}.
+        /// We only model the fields we read; everything else (queued/started
+        /// timestamps, priority, etc.) is irrelevant to import-success polling.
+        /// </summary>
+        public sealed class CommandStatus
+        {
+            // Sonarr's CommandStatus enum: queued | started | completed | failed | aborted | cancelled | orphaned
+            public string Status { get; init; } = "";
+            // CommandResult enum: unknown | successful | unsuccessful
+            public string Result { get; init; } = "";
+            public string? Exception { get; init; }
+            public bool IsEnded => Status switch
+            {
+                "completed" => true,
+                "failed" => true,
+                "aborted" => true,
+                "cancelled" => true,
+                "orphaned" => true,
+                _ => false,
+            };
+        }
+
+        /// <summary>
+        /// GET /api/v3/command/{id}. Returns the current status of a previously
+        /// dispatched command. Used by the import flow (fix24) to poll the
+        /// ManualImport command to completion so we know whether the import
+        /// actually succeeded before we DELETE the queue entry.
+        /// </summary>
+        public static async Task<CommandStatus?> GetCommandStatusAsync(
+            HttpClient http, string basePath, string apiKey, int commandId)
+        {
+            var url = $"{basePath.TrimEnd('/')}/api/v3/command/{commandId}";
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Add("X-Api-Key", apiKey);
+            using var resp = await http.SendAsync(req);
+            if (!resp.IsSuccessStatusCode) return null;
+            var json = await resp.Content.ReadAsStringAsync();
+            try
+            {
+                var parsed = JObject.Parse(json);
+                return new CommandStatus
+                {
+                    Status = parsed["status"]?.ToString() ?? "",
+                    Result = parsed["result"]?.ToString() ?? "",
+                    Exception = parsed["exception"]?.ToString(),
+                };
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }
