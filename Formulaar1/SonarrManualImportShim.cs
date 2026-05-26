@@ -70,9 +70,17 @@ namespace Formulaar1
         }
 
         /// <summary>
-        /// POSTs the given items back to Sonarr's manualimport endpoint.
-        /// Returns (success, responseBody) so the caller can log the
-        /// server's explanation on non-2xx responses.
+        /// Direct POST to /api/v3/manualimport. Imports inline -- the call
+        /// returns once the files are linked into the library -- but does
+        /// NOT go through Sonarr's command/event pipeline. This was the
+        /// fix14-17 default and was reverted in fix18 because the UI didn't
+        /// auto-refresh after the import (the originating client, which is
+        /// us, doesn't have a browser to self-refresh, and the
+        /// EpisodeFileImported event that would have notified other clients
+        /// over SignalR isn't fired on this endpoint).
+        ///
+        /// Kept here as a fallback / diagnostic option; <see cref="CommitViaCommandAsync"/>
+        /// is the path that triggers SignalR events.
         /// </summary>
         public static async Task<(bool Success, string Detail)> CommitAsync(
             HttpClient http, string basePath, string apiKey, List<JObject> items)
@@ -82,6 +90,50 @@ namespace Formulaar1
             using var req = new HttpRequestMessage(HttpMethod.Post, url);
             req.Headers.Add("X-Api-Key", apiKey);
             req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            using var resp = await http.SendAsync(req);
+            var respBody = await resp.Content.ReadAsStringAsync();
+            return (resp.IsSuccessStatusCode, respBody);
+        }
+
+        /// <summary>
+        /// Command-bus form of manual import (fix23). POSTs to
+        /// <c>/api/v3/command</c> with <c>{ name: "ManualImport", importMode,
+        /// files: [...] }</c>. Sonarr dispatches a <c>ManualImportCommand</c>
+        /// through its task queue, which IS what publishes
+        /// <c>EpisodeFileImported</c> and <c>SeriesUpdated</c> events to
+        /// SignalR -- so the web UI auto-refreshes the series page and any
+        /// other connected client sees the import in real time.
+        ///
+        /// <para>
+        /// Async dispatch: Sonarr returns 201 Created with a command id
+        /// immediately; the actual import runs in the background. The 30s
+        /// wait in the caller's smart queue cleanup is plenty for the
+        /// command to finish for a single file.
+        /// </para>
+        ///
+        /// <para>
+        /// The <paramref name="items"/> JObjects must include the fields
+        /// Sonarr's <c>ManualImportFile</c> model needs: <c>path</c>,
+        /// <c>folderName</c>, <c>seriesId</c>, <c>episodeIds</c>,
+        /// <c>quality</c>, <c>languages</c>, <c>releaseGroup</c>,
+        /// <c>indexerFlags</c>, <c>downloadId</c>. Most come straight from
+        /// the GET response; the caller promotes the nested ones and
+        /// derives <c>folderName</c> from <c>path</c>.
+        /// </para>
+        /// </summary>
+        public static async Task<(bool Success, string Detail)> CommitViaCommandAsync(
+            HttpClient http, string basePath, string apiKey, List<JObject> items, string importMode = "auto")
+        {
+            var payload = new JObject
+            {
+                ["name"] = "ManualImport",
+                ["importMode"] = importMode,
+                ["files"] = new JArray(items.Cast<JToken>().ToArray()),
+            };
+            var url = $"{basePath.TrimEnd('/')}/api/v3/command";
+            using var req = new HttpRequestMessage(HttpMethod.Post, url);
+            req.Headers.Add("X-Api-Key", apiKey);
+            req.Content = new StringContent(payload.ToString(), System.Text.Encoding.UTF8, "application/json");
             using var resp = await http.SendAsync(req);
             var respBody = await resp.Content.ReadAsStringAsync();
             return (resp.IsSuccessStatusCode, respBody);

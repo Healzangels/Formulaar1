@@ -221,7 +221,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix22",
+                        version = "v0.5.0-fix23",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -581,7 +581,7 @@ namespace Formulaar1
                         continue;
                     }
 
-                    // fix17: Sonarr's POST handler reads flat seriesId and episodeIds.
+                    // fix17: Sonarr's handler reads flat seriesId and episodeIds.
                     // The nested series.id and episodes[].id in the GET response are
                     // informational; missing flat fields default to 0 and the import
                     // fails with "Series with ID 0 does not exist."
@@ -598,11 +598,39 @@ namespace Formulaar1
                         item["episodeIds"] = episodeIdArr;
                     }
 
+                    // fix23: command-bus ManualImportCommand needs folderName alongside
+                    // path. GET response only gives us path (full file path); derive
+                    // folderName as the containing directory. The direct POST endpoint
+                    // didn't need this -- it inferred from path -- but the command form
+                    // is stricter about its file model.
+                    if (item["folderName"] == null)
+                    {
+                        var path = item["path"]?.ToString();
+                        if (!string.IsNullOrEmpty(path))
+                        {
+                            var folder = Path.GetDirectoryName(path);
+                            if (!string.IsNullOrEmpty(folder))
+                                item["folderName"] = folder;
+                        }
+                    }
+
                     // downloadId on each item links the import event back to the
                     // queue entry from the original release-push so Sonarr can
-                    // atomically clear queue tracking.
+                    // clear queue tracking as a side effect of the import.
                     item["downloadId"] = infoHash;
                     item["importMode"] = "auto";
+
+                    // quality / languages / releaseGroup / indexerFlags / customFormats
+                    // are already populated on the GET response items by Sonarr's parser
+                    // -- we don't need to fabricate them, just let them ride through the
+                    // POST as-is. Log what we have so the next failure is debuggable.
+                    var qualityName = item["quality"]?["quality"]?["name"]?.ToString() ?? "<none>";
+                    var langs = item["languages"] is JArray langArr
+                        ? string.Join(",", langArr.Select(l => l["name"]?.ToString() ?? "?"))
+                        : "<none>";
+                    var releaseGroup = item["releaseGroup"]?.ToString() ?? "<none>";
+                    Console.WriteLine($"[ManualImport] Item enriched: seriesId={item["seriesId"]} episodeIds={item["episodeIds"]} quality='{qualityName}' languages='{langs}' releaseGroup='{releaseGroup}' folderName='{item["folderName"]}'");
+
                     importable.Add(item);
                 }
 
@@ -612,16 +640,22 @@ namespace Formulaar1
                     return;
                 }
 
-                var (ok, detail) = await SonarrManualImportShim.CommitAsync(
+                // fix23: dispatch via the command bus (/api/v3/command) instead of the
+                // direct manualimport POST. The command bus is what fires
+                // EpisodeFileImported and SeriesUpdated events to Sonarr's SignalR hub,
+                // which is what makes the web UI auto-refresh the series page and
+                // updates the queue display in real time -- the missing-UI-refresh
+                // regression that drove the fix18 revert.
+                var (ok, detail) = await SonarrManualImportShim.CommitViaCommandAsync(
                     _httpClient, BaseSonarPath!, SonarApiKey!, importable);
                 if (ok)
                 {
-                    Console.WriteLine($"[ManualImport] Imported {importable.Count} file(s) via manualimport API");
+                    Console.WriteLine($"[ManualImport] Dispatched ManualImport command for {importable.Count} file(s) via /api/v3/command (async; SignalR events should fire)");
                 }
                 else
                 {
                     var snippet = detail.Length > 200 ? detail.Substring(0, 200) + "..." : detail;
-                    Console.WriteLine($"[ManualImport] POST returned non-success: {snippet}. Cleanup will catch the queue entry if it's stuck.");
+                    Console.WriteLine($"[ManualImport] Command-bus POST returned non-success: {snippet}. Cleanup will catch the queue entry if it's stuck.");
                 }
             }
             catch (Exception ex)
