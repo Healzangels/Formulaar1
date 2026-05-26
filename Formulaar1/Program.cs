@@ -221,7 +221,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix24",
+                        version = "v0.5.0-fix25",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -513,11 +513,23 @@ namespace Formulaar1
         {
             if (_importMode == "manualimport")
             {
-                // ImportViaManualImportApi owns its own queue cleanup in fix24:
-                // it polls the command to completion and DELETEs the queue entry
-                // synchronously on success. No 30s "smart cleanup" pass needed
-                // here -- doing both would just race ourselves.
-                await ImportViaManualImportApi(hardpath, infoHash);
+                // fix24: ImportViaManualImportApi owns its own queue cleanup on
+                // the happy path -- it polls the command to completion and
+                // DELETEs the queue entry synchronously when Sonarr reports
+                // success.
+                //
+                // fix25: but if anything goes wrong (HTTP error, command
+                // result=unsuccessful, polling timeout, no importable
+                // suggestions, exception), it returns false and we still need
+                // the 30s smart cleanup so stuck queue entries don't get
+                // orphaned. The file is on disk either way (hardlink happened
+                // before dispatch), the fallback just makes Sonarr's view
+                // consistent.
+                var handled = await ImportViaManualImportApi(hardpath, infoHash);
+                if (!handled)
+                {
+                    await CleanupSonarrQueue(infoHash);
+                }
             }
             else
             {
@@ -560,7 +572,16 @@ namespace Formulaar1
         /// the queue entry on the warning/error path -- the file is still
         /// on disk from the hardlink either way.
         /// </summary>
-        private static async Task ImportViaManualImportApi(string hardpath, string infoHash)
+        /// <summary>
+        /// Returns <c>true</c> only if the import succeeded AND we synchronously
+        /// deleted the queue entry (fix24's happy path). Returns <c>false</c> on
+        /// any failure -- HTTP error on GET/POST, no importable suggestions,
+        /// command id missing, command polling timeout, command result
+        /// unsuccessful, or exceptions. fix25: the caller (ImportViaSonarr)
+        /// uses this signal to decide whether to run the 30s fallback cleanup
+        /// so stuck queue entries from failed imports don't get orphaned.
+        /// </summary>
+        private static async Task<bool> ImportViaManualImportApi(string hardpath, string infoHash)
         {
             try
             {
@@ -638,8 +659,8 @@ namespace Formulaar1
 
                 if (importable.Count == 0)
                 {
-                    Console.WriteLine($"[ManualImport] No importable suggestions ({suggestions.Count} total, all rejected or unparseable). Cleanup will catch the queue entry if it's stuck.");
-                    return;
+                    Console.WriteLine($"[ManualImport] No importable suggestions ({suggestions.Count} total, all rejected or unparseable). Falling back to smart cleanup pass.");
+                    return false;
                 }
 
                 // Dispatch via the command bus (/api/v3/command) so Sonarr fires
@@ -650,41 +671,47 @@ namespace Formulaar1
                 if (!dispatch.Success)
                 {
                     var snippet = dispatch.Detail.Length > 200 ? dispatch.Detail.Substring(0, 200) + "..." : dispatch.Detail;
-                    Console.WriteLine($"[ManualImport] Command-bus POST returned non-success: {snippet}. Cleanup pass will catch the queue entry if it's stuck.");
-                    return;
+                    Console.WriteLine($"[ManualImport] Command-bus POST returned non-success: {snippet}. Falling back to smart cleanup pass.");
+                    return false;
                 }
 
                 Console.WriteLine($"[ManualImport] Dispatched ManualImport command (id={dispatch.CommandId?.ToString() ?? "<unknown>"}) for {importable.Count} file(s)");
+
+                if (dispatch.CommandId is not int cmdId)
+                {
+                    Console.WriteLine($"[ManualImport] Command id missing from dispatch response; falling back to smart cleanup pass");
+                    return false;
+                }
 
                 // fix24: poll the command to completion so we know whether the
                 // import actually succeeded -- instead of inferring from "cleanup
                 // found a warning queue entry, must have worked." Caps at ~30s of
                 // polling at 1s intervals; if Sonarr is still chewing on it after
                 // that we move on and let smart cleanup mop up.
-                if (dispatch.CommandId is int cmdId)
+                var commandSucceeded = await PollCommandToCompletion(cmdId, maxWaitSeconds: 30);
+                if (!commandSucceeded)
                 {
-                    var success = await PollCommandToCompletion(cmdId, maxWaitSeconds: 30);
-                    if (success)
-                    {
-                        // fix24: race CDH for the queue DELETE. When we delete the
-                        // queue entry IMMEDIATELY after our import succeeds, we beat
-                        // (or at least quickly clear) Sonarr's CDH from flipping the
-                        // tracked download into the sticky "warning" state. Net UX:
-                        // queue transitions downloading -> (deleted) without the
-                        // intervening "failed/warning" flash the user saw before.
-                        await DeleteQueueEntryForDownload(infoHash, reason: "ManualImport command succeeded");
-                    }
-                    // If polling reports failure, we leave the queue entry alone --
-                    // user can see the warning, our log line explains why.
+                    // Polling already logged status/exception. Fall back to the
+                    // smart cleanup so any stuck queue entry doesn't get
+                    // orphaned -- the file is on disk either way (we hardlinked
+                    // before dispatch), the cleanup just makes Sonarr's view
+                    // consistent.
+                    return false;
                 }
-                else
-                {
-                    Console.WriteLine($"[ManualImport] Command id missing from dispatch response; falling back to smart cleanup pass");
-                }
+
+                // fix24: race CDH for the queue DELETE. When we delete the
+                // queue entry IMMEDIATELY after our import succeeds, we beat
+                // (or at least quickly clear) Sonarr's CDH from flipping the
+                // tracked download into the sticky "warning" state. Net UX:
+                // queue transitions downloading -> (deleted) without the
+                // intervening "failed/warning" flash the user saw before.
+                await DeleteQueueEntryForDownload(infoHash, reason: "ManualImport command succeeded");
+                return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ManualImport] Failed: {ex.Message}. Cleanup pass will catch the queue entry if it's stuck.");
+                Console.WriteLine($"[ManualImport] Failed: {ex.Message}. Falling back to smart cleanup pass.");
+                return false;
             }
         }
 
