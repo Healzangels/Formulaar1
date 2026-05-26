@@ -173,7 +173,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix16",
+                        version = "v0.5.0-fix17",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -463,6 +463,28 @@ namespace Formulaar1
                             rejections.Select(r => r["reason"]?.ToString() ?? "(unspecified)"));
                         Console.WriteLine($"[ManualImport] Skipping rejected item '{item["name"]}': {reasons}");
                         continue;
+                    }
+
+                    // Sonarr's POST manualimport handler reads seriesId and
+                    // episodeIds as FLAT top-level fields. The nested series.id
+                    // and episodes[].id in the GET response are informational --
+                    // the POST deserializer ignores them and defaults the flat
+                    // fields to 0 if missing, which fails the import with
+                    // "Series with ID 0 does not exist". Extract from the
+                    // nested objects (which the GET correctly populated) and
+                    // promote to top-level. Confirmed in fix16/fix17 testing
+                    // against Sonarr's live /api/v3/manualimport endpoint.
+                    var nestedSeriesId = item["series"]?["id"]?.Value<int?>();
+                    if (nestedSeriesId.HasValue)
+                        item["seriesId"] = nestedSeriesId.Value;
+
+                    if (item["episodes"] is JArray episodesArr)
+                    {
+                        var episodeIdArr = new JArray(
+                            episodesArr.Select(e => e["id"])
+                                       .Where(id => id != null && id.Type != JTokenType.Null)
+                                       .ToArray());
+                        item["episodeIds"] = episodeIdArr;
                     }
 
                     // Ensure downloadId is set on every item so Sonarr can link
