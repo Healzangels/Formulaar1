@@ -173,7 +173,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix15",
+                        version = "v0.5.0-fix16",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -439,8 +439,12 @@ namespace Formulaar1
 
             try
             {
+                // GET without downloadId on purpose -- passing downloadId here
+                // filtered all suggestions to zero in fix15 testing. We still
+                // set item["downloadId"] before CommitAsync below so the POST
+                // links the import to the queue entry.
                 var suggestions = await SonarrManualImportShim.GetSuggestionsAsync(
-                    _httpClient, BaseSonarPath!, SonarApiKey!, hardpath, infoHash);
+                    _httpClient, BaseSonarPath!, SonarApiKey!, hardpath);
 
                 Console.WriteLine($"[ManualImport] GET returned {suggestions.Count} suggestion(s) for {hardpath}");
 

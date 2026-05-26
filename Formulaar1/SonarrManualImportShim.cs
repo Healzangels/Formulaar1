@@ -34,12 +34,22 @@ namespace Formulaar1
     /// </summary>
     internal static class SonarrManualImportShim
     {
+        // Note on downloadId: we deliberately do NOT pass it in the GET query.
+        // Empirical testing (fix15-era diagnostic curls against Sonarr's API)
+        // showed that GET /api/v3/manualimport?downloadId=X filters to 0
+        // results when the folder is anything other than the qBit download
+        // path -- Sonarr's logic appears to be "show me files belonging to
+        // download X in this folder," and our hardlink staging dir isn't
+        // qBit's path, so nothing matches. Without downloadId in the GET,
+        // Sonarr does a plain folder scan and returns the hardlinked file
+        // as importable. The caller still injects downloadId on each item
+        // before CommitAsync so the POST links the import to the queue
+        // entry atomically -- best of both worlds.
         public static async Task<List<JObject>> GetSuggestionsAsync(
-            HttpClient http, string basePath, string apiKey, string folder, string downloadId)
+            HttpClient http, string basePath, string apiKey, string folder)
         {
             var url = $"{basePath.TrimEnd('/')}/api/v3/manualimport" +
                       $"?folder={Uri.EscapeDataString(folder)}" +
-                      $"&downloadId={Uri.EscapeDataString(downloadId)}" +
                       $"&filterExistingFiles=true";
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.Add("X-Api-Key", apiKey);
