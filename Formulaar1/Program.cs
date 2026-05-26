@@ -172,7 +172,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix18",
+                        version = "v0.5.0-fix19-debug",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -456,6 +456,14 @@ namespace Formulaar1
             await _commandApi!.ApiV3CommandPostAsync(commandResource);
             Console.WriteLine($"Sending Command:{commandResource.Name} Mode:{commandResource.ImportMode} Torrent:{torrentName} for path \"{commandResource.Path}\"");
 
+            // === fix19-debug: queue cleanup intentionally SKIPPED ===
+            // We're testing whether Sonarr's queue tracking works naturally on
+            // its own (showing the download lifecycle in the queue tab) without
+            // our DELETE call interfering. If you see stuck "Waiting to Import"
+            // entries after this test, that's the OLD behaviour resurfacing --
+            // click the X in Sonarr's queue tab to clear them manually.
+            Console.WriteLine($"[Hardlinking] (fix19-debug) Skipping queue cleanup for {infoHash} -- observing Sonarr's native queue behaviour. Stuck queue entries may need manual clearing.");
+            /*
             try
             {
                 await Task.Delay(5000);
@@ -478,6 +486,7 @@ namespace Formulaar1
             {
                 Console.WriteLine($"[Hardlinking] Queue cleanup failed (file is imported anyway): {cleanupEx.Message}");
             }
+            */
         }
 
         private static async void _checkEvents(object? sender, System.Timers.ElapsedEventArgs e)
