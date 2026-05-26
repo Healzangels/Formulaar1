@@ -28,9 +28,13 @@ namespace Formulaar1
         // else in the codebase needs auto-cookies.
         private static HttpClient _httpClient = new(new SocketsHttpHandler { UseCookies = false });
 
-        // qBit session cookie (SID), populated by QBittorrentShim.LoginAsync at
-        // startup. Replaces the QBittorrent.Client SDK which couldn't handle
-        // qBit 5.0+ state enum changes (stoppedDL etc.) -- see QBittorrentShim.cs.
+        // qBit session cookie as a full 'name=value' pair (e.g.
+        // "QBT_SID_8080=abc123..."), populated by QBittorrentShim.LoginAsync at
+        // startup. Stored verbatim so the shim can drop it straight into a
+        // Cookie: request header without knowing whether qBit gave us the
+        // legacy 'SID' or the port-namespaced 'QBT_SID_<port>' form (fix21).
+        // Replaces the QBittorrent.Client SDK which couldn't handle qBit 5.0+
+        // state enum changes (stoppedDL etc.) -- see QBittorrentShim.cs.
         private static string? _qBitSid;
 
         // Releases accepted by Sonarr and awaiting qBit completion. Keyed by
@@ -190,7 +194,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix20",
+                        version = "v0.5.0-fix21",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),

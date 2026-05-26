@@ -52,10 +52,21 @@ namespace Formulaar1
         }
 
         /// <summary>
-        /// POST /api/v2/auth/login. Returns the SID cookie value on success,
-        /// null on failure. Body of a successful response is the literal text
-        /// "Ok."; failure is "Fails."; HTTP status is 200 either way, so we
-        /// can't trust the status code alone.
+        /// POST /api/v2/auth/login. Returns the full <c>name=value</c> cookie
+        /// pair (ready to drop into a <c>Cookie:</c> request header) on
+        /// success, null on failure. Body of a successful response is the
+        /// literal text "Ok."; failure is "Fails."; HTTP status is 200 either
+        /// way, so we can't trust the status code alone.
+        ///
+        /// <para>
+        /// Cookie name handling (fix21): qBit's session cookie name depends on
+        /// version. Older builds used <c>SID</c>; current builds (4.x WebUI
+        /// rewrite onward, definitely 5.x) namespace by WebUI port and emit
+        /// <c>QBT_SID_&lt;port&gt;</c> (e.g. <c>QBT_SID_8080</c>) so multiple
+        /// qBit instances on the same host don't fight over a shared cookie
+        /// jar. Match both, and persist the full <c>name=value</c> pair so
+        /// callers don't have to know which form they got back.
+        /// </para>
         /// </summary>
         public static async Task<string?> LoginAsync(
             HttpClient http, string baseUrl, string username, string password)
@@ -91,17 +102,24 @@ namespace Formulaar1
             {
                 foreach (var cookie in cookies)
                 {
-                    if (cookie.StartsWith("SID=", StringComparison.Ordinal))
+                    // Accept both legacy 'SID=' and current 'QBT_SID_<port>='
+                    // names. The Set-Cookie line looks like:
+                    //   QBT_SID_8080=abc123...; HttpOnly; path=/
+                    // We want the leading 'name=value' segment, dropping any
+                    // attributes after the first semicolon.
+                    if (cookie.StartsWith("SID=", StringComparison.Ordinal) ||
+                        cookie.StartsWith("QBT_SID_", StringComparison.Ordinal))
                     {
                         var semi = cookie.IndexOf(';');
-                        var sid = semi > 0
-                            ? cookie.Substring(4, semi - 4)
-                            : cookie.Substring(4);
-                        Console.WriteLine($"[QBit] Login OK, got SID ({sid.Length} chars)");
-                        return sid;
+                        var pair = semi > 0 ? cookie.Substring(0, semi) : cookie;
+                        var eq = pair.IndexOf('=');
+                        var name = eq > 0 ? pair.Substring(0, eq) : pair;
+                        var valLen = eq > 0 ? pair.Length - eq - 1 : 0;
+                        Console.WriteLine($"[QBit] Login OK, got session cookie '{name}' ({valLen} chars)");
+                        return pair;
                     }
                 }
-                Console.WriteLine($"[QBit] Login response had Set-Cookie headers but none started with 'SID='. Cookies: {string.Join(" | ", cookies)}");
+                Console.WriteLine($"[QBit] Login response had Set-Cookie headers but none matched 'SID=' or 'QBT_SID_'. Cookies: {string.Join(" | ", cookies)}");
             }
             else
             {
@@ -116,13 +134,19 @@ namespace Formulaar1
         /// <summary>
         /// GET /api/v2/app/version. Returns the qBit version string, or null
         /// if the request fails. Used as a sanity check after login.
+        ///
+        /// <para>
+        /// <paramref name="cookie"/> is the full <c>name=value</c> pair
+        /// returned by <see cref="LoginAsync"/> -- it's already in
+        /// <c>Cookie:</c>-header form, so we just shove it in verbatim.
+        /// </para>
         /// </summary>
         public static async Task<string?> GetVersionAsync(
-            HttpClient http, string baseUrl, string sid)
+            HttpClient http, string baseUrl, string cookie)
         {
             var url = $"{baseUrl.TrimEnd('/')}/api/v2/app/version";
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.Add("Cookie", $"SID={sid}");
+            req.Headers.Add("Cookie", cookie);
             using var resp = await http.SendAsync(req);
             return resp.IsSuccessStatusCode ? await resp.Content.ReadAsStringAsync() : null;
         }
@@ -131,13 +155,18 @@ namespace Formulaar1
         /// GET /api/v2/torrents/info?hashes=H. Returns torrents matching the
         /// given hash. qBit accepts multiple hashes separated by '|', but
         /// the monitor only ever looks up one at a time.
+        ///
+        /// <para>
+        /// <paramref name="cookie"/> is the full <c>name=value</c> pair
+        /// returned by <see cref="LoginAsync"/>.
+        /// </para>
         /// </summary>
         public static async Task<List<MinimalTorrent>> GetByHashAsync(
-            HttpClient http, string baseUrl, string sid, string hash)
+            HttpClient http, string baseUrl, string cookie, string hash)
         {
             var url = $"{baseUrl.TrimEnd('/')}/api/v2/torrents/info?hashes={Uri.EscapeDataString(hash)}";
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.Add("Cookie", $"SID={sid}");
+            req.Headers.Add("Cookie", cookie);
             using var resp = await http.SendAsync(req);
             resp.EnsureSuccessStatusCode();
             var json = await resp.Content.ReadAsStringAsync();
