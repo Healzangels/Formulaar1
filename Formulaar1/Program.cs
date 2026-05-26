@@ -194,7 +194,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix28",
+                        version = "v1.0.0",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
