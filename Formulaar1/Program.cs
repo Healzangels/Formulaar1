@@ -1,7 +1,6 @@
 using APIv3SonarrDotcore.Api;
 using APIv3SonarrDotcore.Model;
 using Microsoft.AspNetCore.Http.Extensions;
-using Newtonsoft.Json.Linq;
 using QBittorrent.Client;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
@@ -173,7 +172,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v0.5.0-fix17",
+                        version = "v0.5.0-fix18",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -423,116 +422,31 @@ namespace Formulaar1
         }
 
         /// <summary>
-        /// Tells Sonarr to import the hardlinked file. Tries the manualimport
-        /// API first (which links the import to the queue entry via downloadId
-        /// so the queue clears atomically), and falls back to the older
-        /// DownloadedEpisodesScan command + post-hoc queue DELETE if
-        /// manualimport doesn't yield importable suggestions or errors.
+        /// Tells Sonarr to import the hardlinked file via the DownloadedEpisodesScan
+        /// command, then deletes the stale queue entry Sonarr's CDH leaves behind.
         ///
-        /// Both paths produce the same end-of-disk state: file moved/linked
-        /// into the proper Season folder under Sonarr's naming convention.
-        /// They differ only in how the queue tracking entry gets cleared.
+        /// Why this approach (instead of /api/v3/manualimport): scan goes through
+        /// Sonarr's normal import pipeline -- fires EpisodeFileImported events,
+        /// pushes SignalR notifications to the web UI, updates Episode.HasFile.
+        /// The series page reflects the imported file immediately, no manual
+        /// refresh needed. The manualimport API endpoint imports the file too
+        /// but bypasses that event chain, leaving the UI stale until something
+        /// triggers a refresh.
+        ///
+        /// The scan command path was the original design (upstream); we tried
+        /// manualimport in fix14-17 hoping for cleaner queue handling, but the
+        /// UX trade-off wasn't worth it -- atomic queue clearing is invisible,
+        /// while the missing UI update is very visible. Reverted in fix18.
+        ///
+        /// The 5-second wait + DELETE handles Sonarr's CDH race: CDH polls qBit
+        /// independently, sees the completed download, tries to import the
+        /// original qBit-downloaded filename (no SxxExx, fails to parse) and
+        /// leaves the queue in a stuck 'Waiting to Import' state. After our
+        /// scan succeeds and writes EpisodeFileImported to history, we DELETE
+        /// the matching queue entry by downloadId so the queue clears.
         /// </summary>
         private static async Task ImportViaSonarr(string hardpath, string infoHash, string torrentName)
         {
-            bool importedViaManual = false;
-
-            try
-            {
-                // GET without downloadId on purpose -- passing downloadId here
-                // filtered all suggestions to zero in fix15 testing. We still
-                // set item["downloadId"] before CommitAsync below so the POST
-                // links the import to the queue entry.
-                var suggestions = await SonarrManualImportShim.GetSuggestionsAsync(
-                    _httpClient, BaseSonarPath!, SonarApiKey!, hardpath);
-
-                Console.WriteLine($"[ManualImport] GET returned {suggestions.Count} suggestion(s) for {hardpath}");
-
-                var importable = new List<JObject>();
-                foreach (var item in suggestions)
-                {
-                    // Items Sonarr knows it can't accept (wrong quality profile,
-                    // episode already has a higher-scoring file, etc.) come
-                    // back with a non-empty rejections array. Surface those
-                    // reasons in the log so the user can see what Sonarr
-                    // didn't like, but don't try to POST them back.
-                    var rejections = item["rejections"] as JArray;
-                    if (rejections != null && rejections.Count > 0)
-                    {
-                        var reasons = string.Join("; ",
-                            rejections.Select(r => r["reason"]?.ToString() ?? "(unspecified)"));
-                        Console.WriteLine($"[ManualImport] Skipping rejected item '{item["name"]}': {reasons}");
-                        continue;
-                    }
-
-                    // Sonarr's POST manualimport handler reads seriesId and
-                    // episodeIds as FLAT top-level fields. The nested series.id
-                    // and episodes[].id in the GET response are informational --
-                    // the POST deserializer ignores them and defaults the flat
-                    // fields to 0 if missing, which fails the import with
-                    // "Series with ID 0 does not exist". Extract from the
-                    // nested objects (which the GET correctly populated) and
-                    // promote to top-level. Confirmed in fix16/fix17 testing
-                    // against Sonarr's live /api/v3/manualimport endpoint.
-                    var nestedSeriesId = item["series"]?["id"]?.Value<int?>();
-                    if (nestedSeriesId.HasValue)
-                        item["seriesId"] = nestedSeriesId.Value;
-
-                    if (item["episodes"] is JArray episodesArr)
-                    {
-                        var episodeIdArr = new JArray(
-                            episodesArr.Select(e => e["id"])
-                                       .Where(id => id != null && id.Type != JTokenType.Null)
-                                       .ToArray());
-                        item["episodeIds"] = episodeIdArr;
-                    }
-
-                    // Ensure downloadId is set on every item so Sonarr can link
-                    // this manual import to the queue entry from the original
-                    // release-push (the whole point of using this endpoint).
-                    // "auto" import mode lets Sonarr's media-management
-                    // settings decide between move/hardlink/copy.
-                    item["downloadId"] = infoHash;
-                    item["importMode"] = "auto";
-                    importable.Add(item);
-                }
-
-                if (importable.Count > 0)
-                {
-                    var (ok, detail) = await SonarrManualImportShim.CommitAsync(
-                        _httpClient, BaseSonarPath!, SonarApiKey!, importable);
-                    if (ok)
-                    {
-                        Console.WriteLine($"[ManualImport] Imported {importable.Count} file(s) via manualimport API; queue should clear automatically");
-                        importedViaManual = true;
-                    }
-                    else
-                    {
-                        var snippet = detail.Length > 200 ? detail.Substring(0, 200) + "..." : detail;
-                        Console.WriteLine($"[ManualImport] POST returned non-success: {snippet} -- falling back to scan+cleanup");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine($"[ManualImport] No importable suggestions ({suggestions.Count} total, all rejected or unparseable) -- falling back to scan+cleanup");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ManualImport] Failed ({ex.Message}) -- falling back to scan+cleanup");
-            }
-
-            if (importedViaManual) return;
-
-            // Fallback: classic scan command + post-hoc queue DELETE. Kept as
-            // a safety net in case manualimport doesn't apply (Sonarr API
-            // change, an edge case in our payload, network blip mid-request).
-            // Worth keeping deliberately even though fix14 has been stable in
-            // testing -- the two paths converge on identical on-disk state;
-            // the fallback only differs in HOW the queue clears (scan + DELETE
-            // vs manualimport's atomic downloadId linkage). If you ever see
-            // the "falling back to scan+cleanup" log line in normal operation
-            // (not "file already in library" edge), investigate before deleting.
             var commandResource = new CommandResource
             {
                 Name = "DownloadedEpisodesScan",
