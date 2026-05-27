@@ -1,7 +1,15 @@
 
-# Formulaar1
+# Formulaar1 (Healzangels fork)
 
-[![CI](https://github.com/avassdal/Formulaar1/actions/workflows/ci.yml/badge.svg)](https://github.com/avassdal/Formulaar1/actions/workflows/ci.yml)
+> **Fork notice.** This is a maintained fork of [Jimmy062006/Formulaar1](https://github.com/Jimmy062006/Formulaar1) updated for compatibility with current Sonarr v4 and qBittorrent 5.x. The bundled NuGet SDKs in upstream v0.5.0 are abandoned and break on newer Sonarr / qBit schemas; this fork replaces the affected code paths with direct HTTP shims.
+>
+> A pre-built Docker image is published at [healzangels/formulaar1](https://hub.docker.com/r/healzangels/formulaar1) by [Healzangels/formulaar1-docker](https://github.com/Healzangels/formulaar1-docker). For most users, that's the easiest way to deploy.
+>
+> The content below is upstream Formulaar1's README, preserved here for context.
+
+---
+
+# Formulaar1
 
 A small tool that automates Formula 1, Formula 2, and Formula 3 release pushes to Sonarr. It intercepts releases from AutoBrr, matches them to the correct TVDB episode, and forwards them to Sonarr with the correct metadata.
 
