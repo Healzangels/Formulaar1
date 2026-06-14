@@ -194,7 +194,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v1.0.1",
+                        version = "v1.0.2",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -315,7 +315,10 @@ namespace Formulaar1
                                         // by circuit/city. Pick the first venue match that yields
                                         // at least one candidate, so the more specific name wins
                                         // when both are present in the release.
-                                        IEnumerable<EpisodeResource> tmp2 = Enumerable.Empty<EpisodeResource>();
+                                        // Use tmp1's element type for tmp2 (SonarrEpisodeShim.MinimalEpisode),
+                                        // not the SDK's EpisodeResource. Take(0) gives us an empty
+                                        // sequence of the inferred type without needing the type name.
+                                        var tmp2 = tmp1.Take(0);
                                         foreach (var match in matchedVenueKeys)
                                         {
                                             var candidates = tmp1.Where(x =>
