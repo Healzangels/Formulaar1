@@ -194,7 +194,7 @@ namespace Formulaar1
                     var health = new
                     {
                         status = "ok",
-                        version = "v1.0.0",
+                        version = "v1.0.1",
                         uptimeSeconds = (long)(DateTime.UtcNow - _startedAt).TotalSeconds,
                         torrentClient = TorrentClient ?? "none",
                         sonarrConfigured = !string.IsNullOrEmpty(BaseSonarPath) && !string.IsNullOrEmpty(SonarApiKey),
@@ -262,7 +262,19 @@ namespace Formulaar1
                                 if (ReleasePost != null && ReleasePost.Title != null && seriesInfo != null)
                                 {
                                     _ = int.TryParse(Regex.Match(normalisedTitle, @"(?:(?:18|19|20|21)[0-9]{2})").ToString(), out int SeasonID);
-                                    var Country = Countries.FirstOrDefault(x => normalisedTitle.Contains(x.Key, StringComparison.OrdinalIgnoreCase)).Value;
+
+                                    // Find every Countries-dict entry whose KEY appears in the
+                                    // release title, sorted longest-key-first. Release titles often
+                                    // carry both a country and a city/circuit ("Spain.Barcelona",
+                                    // "USA.COTA", "UAE.AbuDhabi") -- if we just took the first dict
+                                    // entry we matched, we'd pick whichever happened to come first
+                                    // in iteration order and potentially miss the more specific
+                                    // venue name TVDB actually uses for the episode title. v1.0.1.
+                                    var matchedVenueKeys = Countries
+                                        .Where(x => normalisedTitle.Contains(x.Key, StringComparison.OrdinalIgnoreCase))
+                                        .OrderByDescending(x => x.Key.Length)
+                                        .ToList();
+                                    var Country = matchedVenueKeys.FirstOrDefault().Value;
 
                                     var ShowType = NormaliseShowType(normalisedTitle);
                                     Console.WriteLine($"ShowType: {ShowType}");
@@ -292,9 +304,34 @@ namespace Formulaar1
                                         var tmp = await SonarrEpisodeShim.GetBySeriesIdAsync(
                                             _httpClient, BaseSonarPath!, SonarApiKey!, Series[0].Id);
                                         //Find Correct Year
-                                        var tmp1 = tmp.Where(x => x.SeasonNumber == SeasonID);
-                                        //Find Correct Country
-                                        var tmp2 = tmp1.Where(x => (x.Title ?? string.Empty).Contains(Country, StringComparison.OrdinalIgnoreCase));
+                                        var tmp1 = tmp.Where(x => x.SeasonNumber == SeasonID).ToList();
+
+                                        // Find Correct Country (v1.0.1):
+                                        // For each matched venue key (longest-first), try filtering
+                                        // episodes whose title contains EITHER the key (e.g.
+                                        // "Barcelona", "COTA") OR the value it resolves to (e.g.
+                                        // "Spain", "United States"). TVDB's per-episode titles are
+                                        // inconsistent -- some races are titled by country, others
+                                        // by circuit/city. Pick the first venue match that yields
+                                        // at least one candidate, so the more specific name wins
+                                        // when both are present in the release.
+                                        IEnumerable<EpisodeResource> tmp2 = Enumerable.Empty<EpisodeResource>();
+                                        foreach (var match in matchedVenueKeys)
+                                        {
+                                            var candidates = tmp1.Where(x =>
+                                            {
+                                                var title = x.Title ?? string.Empty;
+                                                return title.Contains(match.Key, StringComparison.OrdinalIgnoreCase) ||
+                                                       title.Contains(match.Value, StringComparison.OrdinalIgnoreCase);
+                                            }).ToList();
+                                            if (candidates.Count > 0)
+                                            {
+                                                tmp2 = candidates;
+                                                Console.WriteLine($"[Matching] Venue match: '{match.Key}' (resolves to '{match.Value}'); {candidates.Count} episode(s) before session filter");
+                                                break;
+                                            }
+                                        }
+
                                         //Find correct session episode
                                         var tmp3 = GetEpisodesByShowType(tmp2, seriesInfo.Title, ShowType);
 
